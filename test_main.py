@@ -21,6 +21,7 @@ from main import (
     season_for_month,
     resolve_identification,
     regional_species,
+    preferred_regional_species,
     select_sharpest_crops,
     save_bird_image,
     send_email,
@@ -71,14 +72,29 @@ class BirdWatcherTests(unittest.TestCase):
         plausible = regional_species("northern_nj", 7)
         self.assertIn("northerncardinal", plausible)
         self.assertIn("brownheadedcowbird", plausible)
+        self.assertGreaterEqual(len(plausible), 100)
+        self.assertNotIn("oilbird", plausible)
+        preferred = preferred_regional_species("northern_nj", 7)
+        self.assertTrue(preferred <= plausible)
         predictions = [
             ("Azaras Spinetail", 0.55),
             ("Northern Cardinal", 0.30),
             ("House Finch", 0.15),
         ]
-        adjusted = apply_regional_prior(predictions, plausible, weight=3.0)
+        adjusted = apply_regional_prior(predictions, preferred, weight=3.0)
         self.assertEqual(adjusted[0][0], "Northern Cardinal")
         self.assertAlmostEqual(sum(score for _, score in adjusted), 1.0)
+
+    def test_broad_nj_species_receives_a_moderate_boost(self):
+        plausible = regional_species("northern_nj", 7)
+        adjusted = apply_regional_prior(
+            [("Oilbird", 0.45), ("Osprey", 0.35), ("Azaras Spinetail", 0.20)],
+            preferred_species=set(),
+            weight=3.0,
+            plausible_species=plausible,
+            plausible_weight=1.5,
+        )
+        self.assertEqual(adjusted[0][0], "Osprey")
 
     def test_consensus_accepts_agreeing_high_quality_predictions(self):
         result = resolve_identification(

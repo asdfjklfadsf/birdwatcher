@@ -114,27 +114,213 @@ _NORTHERN_NJ_SEASONAL = {
 }
 
 
-def regional_species(profile: str, month: int) -> set[str]:
+# Model labels that intersect the eBird New Jersey all-years checklist. This broad
+# state-level set is a safety boundary, not a claim that every species is common.
+_NEW_JERSEY_MODEL_SPECIES = frozenset(
+    name.strip()
+    for name in
+    """
+American Avocet
+American Bittern
+American Coot
+American Flamingo
+American Goldfinch
+American Kestrel
+American Pipit
+American Redstart
+American Robin
+American Wigeon
+Anhinga
+Bald Eagle
+Baltimore Oriole
+Bar-Tailed Godwit
+Barn Swallow
+Barrows Goldeneye
+Bay-Breasted Warbler
+Belted Kingfisher
+Black Necked Stilt
+Black Skimmer
+Black Swan
+Black Throated Warbler
+Black Vulture
+Black-Capped Chickadee
+Black-Necked Grebe
+Black-Throated Sparrow
+Blackburniam Warbler
+Blue Gray Gnatcatcher
+Blue Grosbeak
+Blue Heron
+Bobolink
+Brewers Blackbird
+Brown Crepper
+Brown Headed Cowbird
+Brown Thrasher
+Bufflehead
+California Gull
+California Quail
+Canvasback
+Cape May Warbler
+Caspian Tern
+Cedar Waxwing
+Cerulean Warbler
+Chipping Sparrow
+Cinnamon Teal
+Common Grackle
+Common Loon
+Common Starling
+Crested Caracara
+Dark Eyed Junco
+Downy Woodpecker
+Dunlin
+Eastern Bluebird
+Eastern Meadowlark
+Eastern Towee
+Egyptian Goose
+European Goldfinch
+Evening Grosbeak
+Glossy Ibis
+Gold Wing Warbler
+Golden Eagle
+Golden Pheasant
+Gray Catbird
+Gray Kingbird
+Gray Partridge
+Grey Plover
+Gyrfalcon
+Harlequin Duck
+Hooded Merganser
+Horned Lark
+House Finch
+House Sparrow
+Indigo Bunting
+Ivory Gull
+Java Sparrow
+Killdear
+King Eider
+Lark Bunting
+Laughing Gull
+Lazuli Bunting
+Limpkin
+Loggerhead Shrike
+Long-Eared Owl
+Mallard Duck
+Masked Booby
+Merlin
+Mourning Dove
+Northern Cardinal
+Northern Flicker
+Northern Fulmar
+Northern Gannet
+Northern Mockingbird
+Northern Parula
+Northern Red Bishop
+Northern Shoveler
+Osprey
+Ovenbird
+Oyster Catcher
+Painted Bunting
+Peregrine Falcon
+Pomarine Jaeger
+Purple Finch
+Purple Gallinule
+Purple Martin
+Razorbill
+Red Billed Tropicbird
+Red Crossbill
+Red Headed Woodpecker
+Red Knot
+Red Shouldered Hawk
+Red Tailed Hawk
+Red Winged Blackbird
+Ring-Necked Pheasant
+Rose Breasted Grosbeak
+Roseate Spoonbill
+Rosy Faced Lovebird
+Rough Leg Buzzard
+Ruby Crowned Kinglet
+Ruby Throated Hummingbird
+Ruddy Shelduck
+Sandhill Crane
+Says Phoebe
+Scarlet Ibis
+Scarlet Tanager
+Short Billed Dowitcher
+Smiths Longspur
+Snow Goose
+Snowy Egret
+Snowy Owl
+Sora
+Surf Scoter
+Tit Mouse
+Townsends Warbler
+Tree Swallow
+Tropical Kingbird
+Trumpter Swan
+Turkey Vulture
+Varied Thrush
+Veery
+Violet Green Swallow
+White Necked Raven
+Wild Turkey
+Wood Duck
+Wood Thrush
+Yellow Breasted Chat
+Yellow Headed Blackbird
+""".splitlines()
+    if name.strip()
+)
+
+
+def _validate_region_profile(profile: str) -> str:
     normalized_profile = profile.strip().casefold().replace("-", "_")
-    if not normalized_profile:
-        return set()
     if normalized_profile != "northern_nj":
         raise ValueError(f"Unsupported REGION_PROFILE: {profile}")
+    return normalized_profile
+
+
+def preferred_regional_species(profile: str, month: int) -> set[str]:
+    """Return supported common/resident labels that receive the seasonal boost."""
+    _validate_region_profile(profile)
     names = _NORTHERN_NJ_RESIDENTS | _NORTHERN_NJ_SEASONAL[season_for_month(month)]
-    return {species_key(name) for name in names}
+    aliases = {species_key("Tufted Titmouse"): species_key("Tit Mouse")}
+    preferred = {aliases.get(species_key(name), species_key(name)) for name in names}
+    supported = {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
+    return preferred & supported
+
+
+def regional_species(profile: str, month: int) -> set[str]:
+    """Return broad NJ-documented model labels used only as a plausibility gate."""
+    _validate_region_profile(profile)
+    season_for_month(month)
+    return {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
 
 
 def apply_regional_prior(
-    predictions: list[tuple[str, float]], plausible_species: set[str], weight: float
+    predictions: list[tuple[str, float]],
+    preferred_species: set[str],
+    weight: float,
+    plausible_species: set[str] | None = None,
+    plausible_weight: float = 1.5,
 ) -> list[tuple[str, float]]:
     if not predictions:
         raise ValueError("Predictions cannot be empty")
     if not math.isfinite(weight) or weight < 1:
         raise ValueError("REGIONAL_PRIOR_WEIGHT must be finite and at least 1")
-    weighted = [
-        (label, score * weight if species_key(label) in plausible_species else score)
-        for label, score in predictions
-    ]
+    if not math.isfinite(plausible_weight) or not 1 <= plausible_weight <= weight:
+        raise ValueError("Broad regional weight must be between 1 and the preferred weight")
+
+    plausible_species = plausible_species or set()
+    weighted = []
+    for label, score in predictions:
+        key = species_key(label)
+        if key in preferred_species:
+            factor = weight
+        elif key in plausible_species:
+            factor = plausible_weight
+        else:
+            factor = 1.0
+        weighted.append((label, score * factor))
+
     total = sum(score for _, score in weighted)
     if total <= 0:
         raise ValueError("Prediction scores must have a positive sum")
@@ -597,10 +783,12 @@ def run(settings: AppSettings) -> None:
     LOG.info("Watching camera %r; images will be saved in %s", settings.camera, settings.image_dir.resolve())
     startup_season = season_for_month(datetime.now().astimezone().month)
     LOG.info(
-        "Regional identification prior: %s (%s, automatic by month; weight %.1fx)",
+        "Regional identification prior: %s (%s, automatic by month; %d preferred at %.1fx / %d broad at 1.5x)",
         settings.region_profile,
         startup_season,
+        len(preferred_regional_species(settings.region_profile, datetime.now().astimezone().month)),
         settings.regional_prior_weight,
+        len(regional_species(settings.region_profile, datetime.now().astimezone().month)),
     )
 
     try:
@@ -635,6 +823,7 @@ def run(settings: AppSettings) -> None:
                 if detection is not None:
                     now = datetime.now().astimezone()
                     plausible = regional_species(settings.region_profile, now.month)
+                    preferred = preferred_regional_species(settings.region_profile, now.month)
                     burst_detections = collect_bird_crops(
                         capture,
                         models,
@@ -649,8 +838,10 @@ def run(settings: AppSettings) -> None:
                         frame_predictions.append(
                             apply_regional_prior(
                                 raw_predictions,
-                                plausible,
+                                preferred,
                                 settings.regional_prior_weight,
+                                plausible_species=plausible,
+                                plausible_weight=1.5,
                             )[:3]
                         )
                     identification = resolve_identification(
