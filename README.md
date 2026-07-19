@@ -1,0 +1,101 @@
+# Local Bird Watcher
+
+A small Python 3.11+ app that continuously reads a webcam, detects birds with a pretrained YOLO COCO model, captures a short image burst, classifies the three sharpest bird crops with a 525-species EfficientNet model, saves the sharpest crop, and emails it through SMTP. Processing is local after the models are downloaded once. It does not capture or analyze audio.
+
+## Models
+
+- **Bird detection:** Ultralytics `yolo11n.pt`, pretrained on COCO. COCO class 14 is used to detect birds. The pinned download is verified by SHA-256 before it is loaded.
+- **Species identification:** Hugging Face `chriamue/bird-species-classifier`, an EfficientNet-B2 classifier trained for 525 bird species. A fixed repository revision and its safetensors weights are used.
+
+Species classification is probabilistic and limited to the classifier's 525 labels. Camera distance, motion blur, obstructions, lighting, and species absent from its training set can reduce accuracy. The email confidence is the classifier's score, not a guarantee that the name is correct.
+
+## Setup
+
+```bash
+cd /home/user/bird_watcher
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env` with your camera and SMTP settings. Never commit `.env`. For Gmail, enable two-step verification and create an app password; do not put your normal account password in the file.
+
+## Run
+
+With the virtual environment active:
+
+```bash
+python main.py
+```
+
+Press `Ctrl+C` to stop. The first run requires internet access to download the pinned YOLO and species models. They are then cached, and later inference is local with no paid API. The supplied Linux dependencies use CPU-only PyTorch to avoid multi-gigabyte CUDA packages.
+
+## Configuration
+
+| Setting | Default | Description |
+|---|---:|---|
+| `CAMERA` | Logitech by-id path | OpenCV camera index or device path; a stable UVC by-id path is configured on this machine |
+| `CAMERA_WIDTH` | `1280` | Capture width; the attached camera's highest useful 4:3 mode |
+| `CAMERA_HEIGHT` | `960` | Capture height |
+| `CAMERA_FPS` | `5` | Stable uncompressed frame rate at high resolution |
+| `COOLDOWN_MINUTES` | `10` | Global email cooldown that suppresses repeated alerts for the same lingering bird |
+| `SCAN_INTERVAL_SECONDS` | `1` | Delay between analyzed frames |
+| `DETECTION_CONFIDENCE` | `0.35` | Minimum YOLO bird confidence |
+| `BIRD_IMAGE_DIR` | `bird_images` | Saved image folder, created automatically |
+| `BURST_FRAMES` | `7` | Frames examined after a bird first appears |
+| `SHARPEST_FRAMES` | `3` | Sharpest detected crops used for identification |
+| `CONSENSUS_MIN_VOTES` | `2` | Required agreeing top predictions |
+| `SPECIES_MIN_CONFIDENCE` | `0.70` | Minimum average winning confidence for a definite name |
+| `SPECIES_MIN_MARGIN` | `0.20` | Minimum average top-one versus top-two score margin |
+| `REGION_PROFILE` | `northern_nj` | Static Northern New Jersey species profile |
+| `REGIONAL_PRIOR_WEIGHT` | `3.0` | Soft multiplier for locally and seasonally plausible species |
+| `DETECTOR_MODEL` | `yolo11n.pt` | Ultralytics detection model |
+| `DETECTOR_MODEL_SHA256` | pinned | Required detector-file checksum |
+| `CLASSIFIER_MODEL` | `chriamue/bird-species-classifier` | Hugging Face species model |
+| `CLASSIFIER_REVISION` | pinned | Required Hugging Face commit revision |
+| `SMTP_HOST`, `SMTP_PORT` | required / `587` | SMTP server |
+| `SMTP_USERNAME`, `SMTP_PASSWORD` | empty | SMTP login; username may be blank for a trusted relay |
+| `EMAIL_FROM`, `EMAIL_TO` | required | Sender and one recipient, or a comma-separated recipient list |
+| `SMTP_USE_SSL` | `false` | Use implicit TLS, commonly port 465 |
+| `SMTP_USE_STARTTLS` | `true` | Upgrade a normal SMTP connection with STARTTLS |
+| `SMTP_ALLOW_INSECURE` | `false` | Explicit opt-in for a trusted plaintext local relay |
+
+The cooldown is tracked globally because an uncertain classifier can assign several names to the same lingering bird. It begins after the image is saved and before SMTP is attempted. The timestamp is persisted in `bird_images/.last_alert`, so restarting the service does not immediately email the same bird again. This prevents changing predictions or an SMTP outage from causing rapid retries or unbounded image creation.
+
+## Camera troubleshooting
+
+Prefer a persistent path under `/dev/v4l/by-id/` over a numeric index or `/dev/videoN`, because numeric enumeration can change and OpenCV backends can interpret indexes differently. This installation uses the attached Logitech UVC camera at `/dev/v4l/by-id/usb-046d_0825_CAA383D0-video-index0`, forces OpenCV's V4L2 backend, and captures uncompressed frames at 1280x960 instead of 640x480 for substantially more detail in saved bird crops. The internal Intel IPU3 camera still requires a libcamera processing pipeline and is not suitable for direct OpenCV/V4L2 capture.
+
+## SMTP examples
+
+Gmail with STARTTLS:
+
+```dotenv
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_SSL=false
+SMTP_USE_STARTTLS=true
+```
+
+Implicit TLS SMTP:
+
+```dotenv
+SMTP_PORT=465
+SMTP_USE_SSL=true
+SMTP_USE_STARTTLS=false
+```
+
+## Behavior and failure handling
+
+- The output folder is created at startup.
+- The clearest candidate in each frame is approximated as the detected bird with the largest confidence-weighted bounding-box area.
+- Seven frames are examined, the three sharpest bird crops are classified, and their predictions are combined.
+- The current month automatically selects winter, spring, summer, or fall. Northern New Jersey resident and seasonal species receive a soft ranking boost; an implausible winner cannot be reported as a certain identification.
+- The regional profile is static and local. It does not use GPS, an address, eBird, a network lookup, or audio, and unusual or rare birds remain possible rather than being hard-deleted.
+- Weak agreement, low confidence, or a small top-two margin produces an `Uncertain bird` alert. Candidate names and scores remain available in the console log but are not presented as a reliable identification.
+- Only the sharpest bird crop is saved, reducing background influence.
+- Detection, classification, image-save, camera-read, and SMTP failures are logged.
+- A failed frame or email does not terminate the watcher.
+- A failed email consumes the current cooldown to prevent retry storms.
