@@ -1,10 +1,11 @@
 import sys
 import types
 import unittest
+import numpy as np
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 # Lightweight stubs let unit tests exercise app logic before ML packages are installed.
 for name in ("cv2", "torch", "transformers", "ultralytics"):
@@ -14,6 +15,7 @@ from main import (
     AppSettings,
     apply_regional_prior,
     combine_classifier_predictions,
+    collect_bird_crops,
     CooldownTracker,
     EmailSettings,
     IdentificationResult,
@@ -24,12 +26,14 @@ from main import (
     open_camera,
     season_for_month,
     resolve_identification,
+    run,
     regional_species,
     preferred_regional_species,
     preferred_regional_species_names,
     select_sharpest_crops,
     save_bird_image,
     send_email,
+    validate_bird_event,
     validate_settings,
 )
 
@@ -151,6 +155,177 @@ class BirdWatcherTests(unittest.TestCase):
         self.assertEqual(models.global_call, ("crop", 20))
         self.assertEqual(models.local_call, ("crop", {"House Finch", "House Sparrow"}, 2))
         self.assertIn("African Firefinch", [name for name, _ in predictions])
+
+    def test_bird_burst_spaces_camera_samples(self):
+        class FakeCapture:
+            def __init__(self):
+                self.frames = iter(["frame-2", "frame-3", "frame-4"])
+
+            def read(self):
+                return True, next(self.frames)
+
+        class FakeModels:
+            def find_best_bird(self, frame, confidence, crop_padding, max_aspect_ratio):
+                self.detection_settings = (crop_padding, max_aspect_ratio)
+                return (f"crop-{frame}", confidence)
+
+        with patch("main.time.sleep") as sleep:
+            detections = collect_bird_crops(
+                FakeCapture(),
+                FakeModels(),
+                ("crop-frame-1", 0.9),
+                burst_frames=4,
+                detection_confidence=0.35,
+                frame_interval=1.0,
+                crop_padding=0.20,
+                max_aspect_ratio=2.5,
+            )
+        self.assertEqual(len(detections), 4)
+        self.assertEqual(sleep.call_args_list, [call(1.0)] * 3)
+
+    def test_detector_crop_uses_configurable_padding(self):
+        models = object.__new__(__import__("main").BirdModels)
+        box = types.SimpleNamespace(
+            xyxy=[types.SimpleNamespace(tolist=lambda: [25, 25, 75, 75])],
+            conf=[0.90],
+        )
+        models.detector = types.SimpleNamespace(
+            predict=lambda **_kwargs: [types.SimpleNamespace(boxes=[box])]
+        )
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+        crop, score = models.find_best_bird(frame, 0.35, crop_padding=0.20)
+
+        self.assertEqual(crop.shape, (70, 70, 3))
+        self.assertEqual(score, 0.90)
+
+    def test_bird_event_gate_rejects_single_frame_false_positive(self):
+        class Crop:
+            shape = (120, 90, 3)
+
+        accepted, reason = validate_bird_event(
+            [(Crop(), 0.35)],
+            min_frames=4,
+            min_median_confidence=0.45,
+            max_aspect_ratio=2.5,
+        )
+        self.assertEqual(accepted, [])
+        self.assertIn("1 valid detection", reason)
+
+    def test_bird_event_gate_rejects_wide_feeder_hardware_crops(self):
+        class WideCrop:
+            shape = (60, 240, 3)
+
+        accepted, reason = validate_bird_event(
+            [(WideCrop(), 0.90)] * 9,
+            min_frames=4,
+            min_median_confidence=0.45,
+            max_aspect_ratio=2.5,
+        )
+        self.assertEqual(accepted, [])
+        self.assertIn("implausible shape", reason)
+
+    def test_bird_event_gate_accepts_repeated_bird_shaped_detections(self):
+        class BirdCrop:
+            shape = (120, 80, 3)
+
+        detections = [(BirdCrop(), score) for score in (0.48, 0.52, 0.60, 0.70)]
+        accepted, reason = validate_bird_event(
+            detections,
+            min_frames=4,
+            min_median_confidence=0.45,
+            max_aspect_ratio=2.5,
+        )
+        self.assertEqual(accepted, detections)
+        self.assertIsNone(reason)
+
+    def test_single_frame_false_positive_cannot_save_or_send_an_alert(self):
+        class Crop:
+            shape = (120, 90, 3)
+
+        class Capture:
+            def __init__(self):
+                self.read_count = 0
+
+            def read(self):
+                self.read_count += 1
+                if self.read_count > 9:
+                    raise KeyboardInterrupt
+                return True, object()
+
+            def get(self, _property):
+                return 1280.0
+
+            def release(self):
+                pass
+
+        models = Mock()
+        models.find_best_bird.side_effect = [(Crop(), 0.35)] + [None] * 8
+        email = EmailSettings(
+            "smtp.example.com", 587, "user", "secret",
+            "from@example.com", "to@example.com", False, True, False,
+        )
+        with TemporaryDirectory() as temp:
+            settings = AppSettings(
+                camera=1,
+                camera_width=1280,
+                camera_height=960,
+                camera_fps=5,
+                image_dir=Path(temp),
+                cooldown=timedelta(minutes=10),
+                scan_interval=0,
+                detection_confidence=0.35,
+                crop_padding=0.20,
+                burst_frames=9,
+                burst_frame_interval=0,
+                sharpest_frames=7,
+                min_valid_bird_frames=4,
+                min_event_detector_confidence=0.45,
+                max_bird_crop_aspect_ratio=2.5,
+                consensus_min_votes=4,
+                species_min_confidence=0.60,
+                species_min_margin=0.20,
+                region_profile="northern_nj",
+                regional_prior_weight=3.0,
+                email=email,
+                detector_model="model.pt",
+                detector_sha256="a" * 64,
+                classifier_model="classifier",
+                classifier_revision="b" * 40,
+                local_classifier_model="imageomics/bioclip",
+                local_classifier_revision="c" * 40,
+                local_classifier_weight=0.65,
+            )
+            with (
+                patch("main.BirdModels", return_value=models),
+                patch("main.open_camera", return_value=Capture()),
+                patch("main.cv2.CAP_PROP_FRAME_WIDTH", 3, create=True),
+                patch("main.cv2.CAP_PROP_FRAME_HEIGHT", 4, create=True),
+                patch("main.time.sleep"),
+                patch("main.save_bird_image") as save,
+                patch("main.send_email") as send,
+            ):
+                run(settings)
+
+        models.identify_species_candidates.assert_not_called()
+        models.identify_local_species_candidates.assert_not_called()
+        save.assert_not_called()
+        send.assert_not_called()
+
+    def test_consensus_uses_aggregate_probability_evidence(self):
+        result = resolve_identification(
+            [
+                [("House Sparrow", 0.51), ("House Finch", 0.49)],
+                [("House Sparrow", 0.51), ("House Finch", 0.49)],
+                [("House Finch", 0.99), ("House Sparrow", 0.01)],
+            ],
+            min_votes=1,
+            min_confidence=0.60,
+            min_margin=0.20,
+        )
+        self.assertEqual(result.candidate_name, "House Finch")
+        self.assertFalse(result.uncertain)
+        self.assertAlmostEqual(result.confidence, (0.49 + 0.49 + 0.99) / 3)
 
     def test_consensus_accepts_agreeing_high_quality_predictions(self):
         result = resolve_identification(
@@ -348,8 +523,13 @@ class BirdWatcherTests(unittest.TestCase):
             cooldown=timedelta(minutes=10),
             scan_interval=1.0,
             detection_confidence=0.35,
-            burst_frames=7,
-            sharpest_frames=3,
+            crop_padding=0.20,
+            burst_frames=9,
+            burst_frame_interval=1.0,
+            sharpest_frames=7,
+            min_valid_bird_frames=4,
+            min_event_detector_confidence=0.45,
+            max_bird_crop_aspect_ratio=2.5,
             consensus_min_votes=2,
             species_min_confidence=0.70,
             species_min_margin=0.20,
@@ -378,8 +558,13 @@ class BirdWatcherTests(unittest.TestCase):
             cooldown=timedelta(0),
             scan_interval=-1.0,
             detection_confidence=1.5,
-            burst_frames=7,
-            sharpest_frames=3,
+            crop_padding=0.20,
+            burst_frames=9,
+            burst_frame_interval=1.0,
+            sharpest_frames=7,
+            min_valid_bird_frames=4,
+            min_event_detector_confidence=0.45,
+            max_bird_crop_aspect_ratio=2.5,
             consensus_min_votes=2,
             species_min_confidence=0.70,
             species_min_margin=0.20,

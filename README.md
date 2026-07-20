@@ -1,6 +1,6 @@
 # Local Bird Watcher
 
-A small Python 3.11+ app that continuously reads a webcam, detects birds with a pretrained YOLO COCO model, captures a short image burst, classifies the three sharpest bird crops with a hybrid BioCLIP and 525-species pipeline, saves the sharpest crop, and emails it through SMTP. Processing is local after the models are downloaded once. It does not capture or analyze audio.
+A small Python 3.11+ app that continuously reads a webcam, detects birds with a pretrained YOLO COCO model, observes the bird across an eight-second window, classifies the seven sharpest bird crops with a hybrid BioCLIP and 525-species pipeline, saves the sharpest crop, and emails it through SMTP. Processing is local after the models are downloaded once. It does not capture or analyze audio.
 
 ## Models
 
@@ -45,12 +45,17 @@ Press `Ctrl+C` to stop. The first run requires internet access to download the p
 | `COOLDOWN_MINUTES` | `10` | Global email cooldown that suppresses repeated alerts for the same lingering bird |
 | `SCAN_INTERVAL_SECONDS` | `1` | Delay between analyzed frames |
 | `DETECTION_CONFIDENCE` | `0.35` | Minimum YOLO bird confidence |
+| `DETECTION_CROP_PADDING` | `0.20` | Add 20% context around a validated raw bird bounding box before classification and attachment |
 | `BIRD_IMAGE_DIR` | `bird_images` | Saved image folder, created automatically |
-| `BURST_FRAMES` | `7` | Frames examined after a bird first appears |
-| `SHARPEST_FRAMES` | `3` | Sharpest detected crops used for identification |
-| `CONSENSUS_MIN_VOTES` | `2` | Required agreeing top predictions |
-| `SPECIES_MIN_CONFIDENCE` | `0.70` | Minimum average winning confidence for a definite name |
-| `SPECIES_MIN_MARGIN` | `0.20` | Minimum average top-one versus top-two score margin |
+| `BURST_FRAMES` | `9` | Temporally spaced frames examined after a bird first appears |
+| `BURST_FRAME_INTERVAL_SECONDS` | `1.0` | Delay between observation samples; nine samples span about eight seconds |
+| `SHARPEST_FRAMES` | `7` | Sharpest detected crops used for identification |
+| `MIN_VALID_BIRD_FRAMES` | `4` | Minimum repeated, plausibly shaped detections required before any image can be saved or emailed |
+| `MIN_EVENT_DETECTOR_CONFIDENCE` | `0.45` | Minimum median YOLO confidence across the accepted event detections |
+| `MAX_BIRD_CROP_ASPECT_RATIO` | `2.5` | Reject extremely wide or tall crops, including the feeder suction-cup false positive |
+| `CONSENSUS_MIN_VOTES` | `4` | Required agreeing top predictions among selected crops |
+| `SPECIES_MIN_CONFIDENCE` | `0.60` | Minimum aggregate hybrid evidence score for a definite name; still requires 4-of-7 votes and the margin gate |
+| `SPECIES_MIN_MARGIN` | `0.20` | Minimum aggregate top-one versus top-two evidence-score margin |
 | `REGION_PROFILE` | `northern_nj` | Northern New Jersey preferred tier plus broad New Jersey safety tier |
 | `REGIONAL_PRIOR_WEIGHT` | `3.0` | Soft multiplier for common/resident and seasonally preferred species |
 | `DETECTOR_MODEL` | `yolo11n.pt` | Ultralytics detection model |
@@ -96,8 +101,11 @@ SMTP_USE_STARTTLS=false
 
 - The output folder is created at startup.
 - The clearest candidate in each frame is approximated as the detected bird with the largest confidence-weighted bounding-box area.
-- Seven frames are examined, the three sharpest bird crops are classified, and their predictions are combined.
-- Each selected crop is evaluated by both classifiers. BioCLIP supplies stronger evidence among common local/current-season species, while the 525-label classifier preserves unusual candidates. Their normalized scores are blended before multi-frame consensus.
+- Valid bird boxes receive 20% padding before classification and attachment, providing more room around the head, tail, feet, and perch. The feeder-shape rejection is applied to the original YOLO box before padding.
+- Nine frames are sampled one second apart, spanning about eight seconds; the seven sharpest valid bird crops are classified. This captures different poses instead of several nearly identical consecutive frames.
+- Before classification, saving, or email, an event must contain at least four plausibly bird-shaped detections and their median YOLO confidence must be at least 45%. Sparse or feeder-shaped false positives are logged and suppressed without creating an image or sending mail.
+- Each selected crop is evaluated by both classifiers. BioCLIP supplies stronger evidence among common local/current-season species, while the 525-label classifier preserves unusual candidates. Complete normalized hybrid distributions are averaged across the observation before vote, aggregate-score, and margin gates are applied.
+- While the persistent global cooldown is active, extended multi-image classification is skipped to avoid repeatedly spending CPU on the same lingering bird.
 - The current month automatically selects winter, spring, summer, or fall. Supported Northern New Jersey resident and seasonal labels receive the preferred `3x` boost.
 - A broad safety tier contains 146 classifier labels intersected with the eBird New Jersey all-years checklist. These receive a smaller `1.5x` boost and can pass the geographic plausibility gate, preventing the short backyard list from excluding legitimate migrants, wetland birds, raptors, and uncommon visitors.
 - The eBird-derived intersection is stored locally and does not make runtime network requests. It is a broad state-level safety boundary, not a claim that every included species is common in Northern New Jersey. Species outside both tiers remain visible to the classifier but cannot be presented as certain.

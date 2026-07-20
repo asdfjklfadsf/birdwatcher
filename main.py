@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
+from statistics import median
+from typing import Any
 
 import cv2
 from dotenv import load_dotenv
@@ -422,8 +424,13 @@ class AppSettings:
     cooldown: timedelta
     scan_interval: float
     detection_confidence: float
+    crop_padding: float
     burst_frames: int
+    burst_frame_interval: float
     sharpest_frames: int
+    min_valid_bird_frames: int
+    min_event_detector_confidence: float
+    max_bird_crop_aspect_ratio: float
     consensus_min_votes: int
     species_min_confidence: float
     species_min_margin: float
@@ -462,21 +469,19 @@ def resolve_identification(
         raise ValueError("At least one nonempty prediction list is required")
 
     votes = Counter(predictions[0][0] for predictions in frame_predictions)
-    confidence_sums: defaultdict[str, float] = defaultdict(float)
     aggregate_scores: defaultdict[str, float] = defaultdict(float)
     for predictions in frame_predictions:
-        confidence_sums[predictions[0][0]] += predictions[0][1]
         for label, score in predictions:
             aggregate_scores[label] += score
 
-    candidate_name = max(votes, key=lambda label: (votes[label], confidence_sums[label], label))
-    winning_frames = [predictions for predictions in frame_predictions if predictions[0][0] == candidate_name]
-    confidence = sum(predictions[0][1] for predictions in winning_frames) / len(winning_frames)
-    margins = [
-        predictions[0][1] - (predictions[1][1] if len(predictions) > 1 else 0.0)
-        for predictions in winning_frames
-    ]
-    margin = sum(margins) / len(margins)
+    frame_count = len(frame_predictions)
+    ranked_scores = sorted(
+        aggregate_scores.items(), key=lambda item: (-item[1], item[0])
+    )
+    candidate_name, candidate_total = ranked_scores[0]
+    confidence = candidate_total / frame_count
+    runner_up_confidence = ranked_scores[1][1] / frame_count if len(ranked_scores) > 1 else 0.0
+    margin = confidence - runner_up_confidence
     vote_count = votes[candidate_name]
     out_of_region = bool(plausible_species) and species_key(candidate_name) not in plausible_species
     uncertain = (
@@ -486,12 +491,8 @@ def resolve_identification(
         or out_of_region
     )
     display_name = candidate_name if not uncertain else "Uncertain bird"
-    frame_count = len(frame_predictions)
     top_candidates = tuple(
-        (label, total / frame_count)
-        for label, total in sorted(
-            aggregate_scores.items(), key=lambda item: (-item[1], item[0])
-        )[:3]
+        (label, total / frame_count) for label, total in ranked_scores[:3]
     )
     return IdentificationResult(
         display_name=display_name,
@@ -541,10 +542,23 @@ def validate_settings(settings: AppSettings) -> None:
         raise ValueError("SCAN_INTERVAL_SECONDS must be finite and nonnegative")
     if not math.isfinite(settings.detection_confidence) or not 0 < settings.detection_confidence <= 1:
         raise ValueError("DETECTION_CONFIDENCE must be greater than 0 and at most 1")
+    if not math.isfinite(settings.crop_padding) or not 0 <= settings.crop_padding <= 1:
+        raise ValueError("DETECTION_CROP_PADDING must be between 0 and 1")
     if settings.burst_frames < 1:
         raise ValueError("BURST_FRAMES must be at least 1")
+    if not math.isfinite(settings.burst_frame_interval) or settings.burst_frame_interval < 0:
+        raise ValueError("BURST_FRAME_INTERVAL_SECONDS must be finite and nonnegative")
     if not 1 <= settings.sharpest_frames <= settings.burst_frames:
         raise ValueError("SHARPEST_FRAMES must be between 1 and BURST_FRAMES")
+    if not 1 <= settings.min_valid_bird_frames <= settings.burst_frames:
+        raise ValueError("MIN_VALID_BIRD_FRAMES must be between 1 and BURST_FRAMES")
+    if not 0 < settings.min_event_detector_confidence <= 1:
+        raise ValueError("MIN_EVENT_DETECTOR_CONFIDENCE must be greater than 0 and at most 1")
+    if (
+        not math.isfinite(settings.max_bird_crop_aspect_ratio)
+        or settings.max_bird_crop_aspect_ratio < 1
+    ):
+        raise ValueError("MAX_BIRD_CROP_ASPECT_RATIO must be finite and at least 1")
     if not 1 <= settings.consensus_min_votes <= settings.sharpest_frames:
         raise ValueError("CONSENSUS_MIN_VOTES must be between 1 and SHARPEST_FRAMES")
     if not 0 <= settings.species_min_confidence <= 1:
@@ -602,10 +616,17 @@ def load_settings() -> AppSettings:
         cooldown=timedelta(minutes=float(os.getenv("COOLDOWN_MINUTES", "10"))),
         scan_interval=float(os.getenv("SCAN_INTERVAL_SECONDS", "1")),
         detection_confidence=float(os.getenv("DETECTION_CONFIDENCE", "0.35")),
-        burst_frames=int(os.getenv("BURST_FRAMES", "7")),
-        sharpest_frames=int(os.getenv("SHARPEST_FRAMES", "3")),
-        consensus_min_votes=int(os.getenv("CONSENSUS_MIN_VOTES", "2")),
-        species_min_confidence=float(os.getenv("SPECIES_MIN_CONFIDENCE", "0.70")),
+        crop_padding=float(os.getenv("DETECTION_CROP_PADDING", "0.20")),
+        burst_frames=int(os.getenv("BURST_FRAMES", "9")),
+        burst_frame_interval=float(os.getenv("BURST_FRAME_INTERVAL_SECONDS", "1.0")),
+        sharpest_frames=int(os.getenv("SHARPEST_FRAMES", "7")),
+        min_valid_bird_frames=int(os.getenv("MIN_VALID_BIRD_FRAMES", "4")),
+        min_event_detector_confidence=float(
+            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.45")
+        ),
+        max_bird_crop_aspect_ratio=float(os.getenv("MAX_BIRD_CROP_ASPECT_RATIO", "2.5")),
+        consensus_min_votes=int(os.getenv("CONSENSUS_MIN_VOTES", "4")),
+        species_min_confidence=float(os.getenv("SPECIES_MIN_CONFIDENCE", "0.60")),
         species_min_margin=float(os.getenv("SPECIES_MIN_MARGIN", "0.20")),
         region_profile=os.getenv("REGION_PROFILE", "northern_nj").strip(),
         regional_prior_weight=float(os.getenv("REGIONAL_PRIOR_WEIGHT", "3.0")),
@@ -811,8 +832,18 @@ class BirdModels:
         self._local_text_cache = {}
         LOG.info("Models ready; species classifiers device: %s", self.device)
 
-    def find_best_bird(self, frame, confidence: float):
+    def find_best_bird(
+        self,
+        frame,
+        confidence: float,
+        crop_padding: float = 0.08,
+        max_aspect_ratio: float = math.inf,
+    ):
         """Return (cropped bird image, detector confidence), or None."""
+        if not math.isfinite(crop_padding) or not 0 <= crop_padding <= 1:
+            raise ValueError("Bird crop padding must be between 0 and 1")
+        if max_aspect_ratio < 1:
+            raise ValueError("Maximum bird-box aspect ratio must be at least 1")
         results = self.detector.predict(
             source=frame,
             classes=[14],  # COCO class 14 is bird.
@@ -824,13 +855,20 @@ class BirdModels:
         for box in results[0].boxes:
             x1, y1, x2, y2 = (int(value) for value in box.xyxy[0].tolist())
             score = float(box.conf[0])
-            area = max(0, x2 - x1) * max(0, y2 - y1)
+            box_width = max(0, x2 - x1)
+            box_height = max(0, y2 - y1)
+            if box_width == 0 or box_height == 0:
+                continue
+            aspect_ratio = max(box_width / box_height, box_height / box_width)
+            if aspect_ratio > max_aspect_ratio:
+                continue
+            area = box_width * box_height
             candidates.append((area * score, score, x1, y1, x2, y2))
         if not candidates:
             return None
 
         _, score, x1, y1, x2, y2 = max(candidates)
-        padding = int(0.08 * max(x2 - x1, y2 - y1))
+        padding = int(crop_padding * max(x2 - x1, y2 - y1))
         x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
         x2, y2 = min(width, x2 + padding), min(height, y2 + padding)
         crop = frame[y1:y2, x1:x2].copy()
@@ -913,21 +951,77 @@ def collect_bird_crops(
     initial_detection,
     burst_frames: int,
     detection_confidence: float,
+    frame_interval: float = 0.0,
+    crop_padding: float = 0.08,
+    max_aspect_ratio: float = math.inf,
 ):
+    if not math.isfinite(frame_interval) or frame_interval < 0:
+        raise ValueError("BURST_FRAME_INTERVAL_SECONDS must be finite and nonnegative")
     detections = [initial_detection]
     for _ in range(burst_frames - 1):
+        if frame_interval:
+            time.sleep(frame_interval)
         ok, frame = capture.read()
         if not ok or frame is None:
             LOG.warning("Camera read failed during bird burst; skipping frame")
             continue
         try:
-            detection = models.find_best_bird(frame, detection_confidence)
+            detection = models.find_best_bird(
+                frame,
+                detection_confidence,
+                crop_padding,
+                max_aspect_ratio,
+            )
         except Exception:
             LOG.exception("Bird detection failed on a burst frame; skipping frame")
             continue
         if detection is not None:
             detections.append(detection)
     return detections
+
+
+def validate_bird_event(
+    detections: list[tuple[Any, float]],
+    min_frames: int,
+    min_median_confidence: float,
+    max_aspect_ratio: float,
+) -> tuple[list[tuple[Any, float]], str | None]:
+    """Reject sparse, weak, or implausibly shaped detector events before email."""
+    if min_frames < 1:
+        raise ValueError("Minimum bird-event frame count must be positive")
+    if not 0 < min_median_confidence <= 1:
+        raise ValueError("Minimum event detector confidence must be in (0, 1]")
+    if not math.isfinite(max_aspect_ratio) or max_aspect_ratio < 1:
+        raise ValueError("Maximum bird-crop aspect ratio must be finite and at least 1")
+
+    plausible = []
+    rejected_shapes = 0
+    for crop, score in detections:
+        height, width = crop.shape[:2]
+        if height <= 0 or width <= 0:
+            rejected_shapes += 1
+            continue
+        aspect_ratio = max(width / height, height / width)
+        if aspect_ratio > max_aspect_ratio:
+            rejected_shapes += 1
+            continue
+        plausible.append((crop, score))
+
+    if len(plausible) < min_frames:
+        reason = (
+            f"only {len(plausible)} valid detection(s), require {min_frames}"
+        )
+        if rejected_shapes:
+            reason += f"; rejected {rejected_shapes} crop(s) with implausible shape"
+        return [], reason
+
+    event_confidence = median(score for _, score in plausible)
+    if event_confidence < min_median_confidence:
+        return [], (
+            f"median detector confidence {event_confidence:.1%} is below "
+            f"{min_median_confidence:.1%}"
+        )
+    return plausible, None
 
 
 def open_camera(camera: int | str, width: int, height: int, fps: float):
@@ -1000,9 +1094,18 @@ def run(settings: AppSettings) -> None:
                 continue
 
             try:
-                detection = models.find_best_bird(frame, settings.detection_confidence)
+                detection = models.find_best_bird(
+                    frame,
+                    settings.detection_confidence,
+                    settings.crop_padding,
+                    settings.max_bird_crop_aspect_ratio,
+                )
                 if detection is not None:
                     now = datetime.now().astimezone()
+                    if not cooldown.is_ready("bird", now):
+                        LOG.debug("Cooldown active; skipping extended bird identification")
+                        time.sleep(max(0.0, settings.scan_interval))
+                        continue
                     broad = regional_species(settings.region_profile, now.month)
                     plausible = identification_plausible_species(
                         settings.region_profile, now.month
@@ -1017,8 +1120,26 @@ def run(settings: AppSettings) -> None:
                         detection,
                         settings.burst_frames,
                         settings.detection_confidence,
+                        settings.burst_frame_interval,
+                        settings.crop_padding,
+                        settings.max_bird_crop_aspect_ratio,
                     )
-                    selected = select_sharpest_crops(burst_detections, settings.sharpest_frames)
+                    valid_detections, rejection_reason = validate_bird_event(
+                        burst_detections,
+                        settings.min_valid_bird_frames,
+                        settings.min_event_detector_confidence,
+                        settings.max_bird_crop_aspect_ratio,
+                    )
+                    if not valid_detections:
+                        LOG.info(
+                            "Suppressed false bird event: %s; no image saved or email sent",
+                            rejection_reason,
+                        )
+                        time.sleep(max(0.0, settings.scan_interval))
+                        continue
+                    selected = select_sharpest_crops(
+                        valid_detections, settings.sharpest_frames
+                    )
                     frame_predictions = []
                     for bird_image, _ in selected:
                         frame_predictions.append(
@@ -1030,7 +1151,7 @@ def run(settings: AppSettings) -> None:
                                 broad,
                                 settings.regional_prior_weight,
                                 settings.local_classifier_weight,
-                            )[:3]
+                            )
                         )
                     identification = resolve_identification(
                         frame_predictions,
