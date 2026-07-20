@@ -34,6 +34,7 @@ from main import (
     select_sharpest_crops,
     send_email,
     validate_bird_event,
+    validate_visual_bird_presence,
     validate_settings,
 )
 
@@ -316,6 +317,37 @@ class BirdWatcherTests(unittest.TestCase):
         self.assertEqual(accepted, detections)
         self.assertIsNone(reason)
 
+    def test_presence_gate_rejects_repeated_empty_feeder_crops(self):
+        crops = [("dish-a", 0.69), ("dish-b", 0.66), ("dish-c", 0.71), ("dish-d", 0.68)]
+        scores = {"dish-a": 0.009, "dish-b": 0.054, "dish-c": 0.03, "dish-d": 0.02}
+
+        accepted, reason, measured = validate_visual_bird_presence(
+            crops,
+            scores.__getitem__,
+            min_score=0.50,
+            min_frames=2,
+        )
+
+        self.assertEqual(accepted, [])
+        self.assertIsNotNone(reason)
+        self.assertIn("only 0 crop", reason or "")
+        self.assertEqual(measured, [0.009, 0.054, 0.03, 0.02])
+
+    def test_presence_gate_accepts_repeated_real_bird_crops(self):
+        crops = [("bird-a", 0.075), ("bird-b", 0.10), ("bird-c", 0.12)]
+        scores = {"bird-a": 0.557, "bird-b": 0.91, "bird-c": 0.99}
+
+        accepted, reason, measured = validate_visual_bird_presence(
+            crops,
+            scores.__getitem__,
+            min_score=0.50,
+            min_frames=2,
+        )
+
+        self.assertEqual(accepted, crops)
+        self.assertIsNone(reason)
+        self.assertEqual(measured, [0.557, 0.91, 0.99])
+
     def test_single_frame_false_positive_cannot_save_or_send_an_alert(self):
         class Crop:
             shape = (120, 90, 3)
@@ -360,6 +392,8 @@ class BirdWatcherTests(unittest.TestCase):
                 min_event_detector_confidence=0.45,
                 detection_floor_confidence=0.10,
                 max_bird_crop_aspect_ratio=2.5,
+                min_bird_presence_score=0.50,
+                min_bird_presence_frames=2,
                 consensus_min_votes=4,
                 species_min_confidence=0.60,
                 species_min_margin=0.20,
@@ -609,6 +643,8 @@ class BirdWatcherTests(unittest.TestCase):
             min_event_detector_confidence=0.45,
             detection_floor_confidence=0.10,
             max_bird_crop_aspect_ratio=2.5,
+            min_bird_presence_score=0.50,
+            min_bird_presence_frames=2,
             consensus_min_votes=2,
             species_min_confidence=0.70,
             species_min_margin=0.20,
@@ -645,6 +681,8 @@ class BirdWatcherTests(unittest.TestCase):
             min_event_detector_confidence=0.45,
             detection_floor_confidence=0.10,
             max_bird_crop_aspect_ratio=2.5,
+            min_bird_presence_score=0.50,
+            min_bird_presence_frames=2,
             consensus_min_votes=2,
             species_min_confidence=0.70,
             species_min_margin=0.20,

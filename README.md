@@ -54,6 +54,8 @@ Press `Ctrl+C` to stop. The first run requires internet access to download the p
 | `MIN_EVENT_DETECTOR_CONFIDENCE` | `0.07` | Minimum median YOLO confidence across the accepted event detections |
 | `DETECTION_FLOOR_CONFIDENCE` | `0.05` | Lowest YOLO confidence the multi-scale sweep will accept for small or distant birds; must not exceed `MIN_EVENT_DETECTOR_CONFIDENCE` |
 | `MAX_BIRD_CROP_ASPECT_RATIO` | `2.5` | Reject extremely wide or tall crops, including the feeder suction-cup false positive |
+| `MIN_BIRD_PRESENCE_SCORE` | `0.50` | Minimum local BioCLIP bird-vs-empty-feeder evidence for a crop to count as visibly containing a real bird |
+| `MIN_BIRD_PRESENCE_FRAMES` | `2` | Repeated crops that must pass the visual bird-presence gate before classification, saving, cooldown, or email |
 | `CONSENSUS_MIN_VOTES` | `4` | Required agreeing top predictions among selected crops |
 | `SPECIES_MIN_CONFIDENCE` | `0.60` | Minimum aggregate hybrid evidence score for a definite name; still requires 4-of-7 votes and the margin gate |
 | `SPECIES_MIN_MARGIN` | `0.20` | Minimum aggregate top-one versus top-two evidence-score margin |
@@ -102,9 +104,10 @@ SMTP_USE_STARTTLS=false
 
 - The output folder is created at startup.
 - The clearest candidate in each frame is approximated as the detected bird with the largest confidence-weighted bounding-box area.
-- Valid bird boxes receive 20% padding before classification and attachment, providing more room around the head, tail, feet, and perch. The feeder-shape rejection is applied to the original YOLO box before padding.
+- YOLO detections must also pass a separate local BioCLIP bird-vs-empty-feeder gate. This prevents transparent feeder dishes, seeds, glare, or hardware from being emailed merely because the species classifier is forced to choose a bird label.
+- Valid bird boxes receive at least 20% padding; small/distant boxes receive size-adaptive additional context. Small saved crops are LANCZOS-upscaled to a 320-pixel short side for readable email attachments. Shape rejection is applied to the original YOLO box before padding.
 - Nine frames are sampled one second apart, spanning about eight seconds; the seven sharpest valid bird crops are classified. This captures different poses instead of several nearly identical consecutive frames.
-- Before classification, saving, or email, an event must contain at least four plausibly bird-shaped detections and their median YOLO confidence must be at least 45%. Sparse or feeder-shaped false positives are logged and suppressed without creating an image or sending mail.
+- Before classification, saving, or email, an event must contain at least four plausibly bird-shaped YOLO detections with median confidence of at least 7%, followed by at least two crops scoring 50% or higher on the local BioCLIP bird-vs-empty-feeder gate. Sparse, weak, feeder-shaped, and empty-dish events are logged and suppressed without creating an image or sending mail.
 - Each selected crop is evaluated by both classifiers. BioCLIP supplies stronger evidence among common local/current-season species, while the 525-label classifier preserves unusual candidates. Complete normalized hybrid distributions are averaged across the observation before vote, aggregate-score, and margin gates are applied.
 - While the persistent global cooldown is active, extended multi-image classification is skipped to avoid repeatedly spending CPU on the same lingering bird.
 - The current month automatically selects winter, spring, summer, or fall. Supported Northern New Jersey resident and seasonal labels receive the preferred `3x` boost.

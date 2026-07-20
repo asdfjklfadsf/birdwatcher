@@ -432,6 +432,8 @@ class AppSettings:
     min_event_detector_confidence: float
     detection_floor_confidence: float
     max_bird_crop_aspect_ratio: float
+    min_bird_presence_score: float
+    min_bird_presence_frames: int
     consensus_min_votes: int
     species_min_confidence: float
     species_min_margin: float
@@ -566,6 +568,12 @@ def validate_settings(settings: AppSettings) -> None:
         or settings.max_bird_crop_aspect_ratio < 1
     ):
         raise ValueError("MAX_BIRD_CROP_ASPECT_RATIO must be finite and at least 1")
+    if not 0 <= settings.min_bird_presence_score <= 1:
+        raise ValueError("MIN_BIRD_PRESENCE_SCORE must be between 0 and 1")
+    if not 1 <= settings.min_bird_presence_frames <= settings.min_valid_bird_frames:
+        raise ValueError(
+            "MIN_BIRD_PRESENCE_FRAMES must be between 1 and MIN_VALID_BIRD_FRAMES"
+        )
     if not 1 <= settings.consensus_min_votes <= settings.sharpest_frames:
         raise ValueError("CONSENSUS_MIN_VOTES must be between 1 and SHARPEST_FRAMES")
     if not 0 <= settings.species_min_confidence <= 1:
@@ -635,6 +643,8 @@ def load_settings() -> AppSettings:
             os.getenv("DETECTION_FLOOR_CONFIDENCE", "0.05")
         ),
         max_bird_crop_aspect_ratio=float(os.getenv("MAX_BIRD_CROP_ASPECT_RATIO", "2.5")),
+        min_bird_presence_score=float(os.getenv("MIN_BIRD_PRESENCE_SCORE", "0.50")),
+        min_bird_presence_frames=int(os.getenv("MIN_BIRD_PRESENCE_FRAMES", "2")),
         consensus_min_votes=int(os.getenv("CONSENSUS_MIN_VOTES", "4")),
         species_min_confidence=float(os.getenv("SPECIES_MIN_CONFIDENCE", "0.60")),
         species_min_margin=float(os.getenv("SPECIES_MIN_MARGIN", "0.20")),
@@ -1035,6 +1045,51 @@ class BirdModels:
             for confidence, class_id in zip(confidences.tolist(), class_ids.tolist())
         ]
 
+    def bird_presence_score(self, bird_image) -> float:
+        """Return local BioCLIP evidence that a crop contains a real bird.
+
+        This is intentionally separate from species identification. It compares
+        explicit bird prompts against empty-feeder/dish prompts so a YOLO false
+        positive cannot become an email merely because a closed-set species
+        classifier must choose some bird label.
+        """
+        from PIL import Image
+
+        text_features = getattr(self, "_bird_presence_text_features", None)
+        if text_features is None:
+            prompt_groups = (
+                (
+                    "a photograph of a real bird at a bird feeder",
+                    "a real bird with feathers, head, beak, body and legs",
+                    "a perched wild bird",
+                    "a small bird eating seeds",
+                ),
+                (
+                    "an empty bird feeder with no bird",
+                    "a clear plastic feeder dish and seeds",
+                    "bird feeder hardware with no animal",
+                    "an empty feeding tray, foliage and reflections",
+                ),
+            )
+            prompts = [prompt for group in prompt_groups for prompt in group]
+            with self.torch.inference_mode():
+                features = self.local_classifier.encode_text(
+                    self.local_tokenizer(prompts).to(self.device)
+                )
+                features = features / features.norm(dim=-1, keepdim=True)
+                features = features.reshape(2, len(prompt_groups[0]), -1).mean(dim=1)
+                text_features = features / features.norm(dim=-1, keepdim=True)
+            self._bird_presence_text_features = text_features.T.contiguous()
+
+        rgb_image = cv2.cvtColor(bird_image, cv2.COLOR_BGR2RGB)
+        image_tensor = self.local_preprocess(Image.fromarray(rgb_image)).unsqueeze(0).to(self.device)
+        with self.torch.inference_mode():
+            image_features = self.local_classifier.encode_image(image_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            logits = 100.0 * image_features @ self._bird_presence_text_features
+            probabilities = self.torch.softmax(logits, dim=-1)[0]
+        return float(probabilities[0])
+
 
 def collect_bird_crops(
     capture,
@@ -1115,6 +1170,35 @@ def validate_bird_event(
             f"{min_median_confidence:.1%}"
         )
     return plausible, None
+
+
+def validate_visual_bird_presence(
+    detections: list[tuple[Any, float]],
+    scorer,
+    min_score: float,
+    min_frames: int,
+) -> tuple[list[tuple[Any, float]], str | None, list[float]]:
+    """Require repeated BioCLIP evidence of a real bird before side effects."""
+    if not 0 <= min_score <= 1:
+        raise ValueError("Minimum bird-presence score must be between 0 and 1")
+    if min_frames < 1:
+        raise ValueError("Minimum bird-presence frame count must be positive")
+
+    accepted = []
+    scores = []
+    for crop, detector_score in detections:
+        score = float(scorer(crop))
+        scores.append(score)
+        if score >= min_score:
+            accepted.append((crop, detector_score))
+
+    if len(accepted) < min_frames:
+        median_score = median(scores) if scores else 0.0
+        return [], (
+            f"only {len(accepted)} crop(s) passed bird-presence score {min_score:.1%}, "
+            f"require {min_frames}; median presence score {median_score:.1%}"
+        ), scores
+    return accepted, None, scores
 
 
 def open_camera(camera: int | str, width: int, height: int, fps: float):
@@ -1232,8 +1316,31 @@ def run(settings: AppSettings) -> None:
                         )
                         time.sleep(max(0.0, settings.scan_interval))
                         continue
+                    presence_detections, presence_reason, presence_scores = (
+                        validate_visual_bird_presence(
+                            valid_detections,
+                            models.bird_presence_score,
+                            settings.min_bird_presence_score,
+                            settings.min_bird_presence_frames,
+                        )
+                    )
+                    if not presence_detections:
+                        LOG.info(
+                            "Suppressed empty-feeder event: %s; scores=%s; "
+                            "no image saved or email sent",
+                            presence_reason,
+                            ", ".join(f"{score:.1%}" for score in presence_scores),
+                        )
+                        time.sleep(max(0.0, settings.scan_interval))
+                        continue
+                    LOG.info(
+                        "Bird-presence gate passed: %d/%d crop(s), median %.1f%%",
+                        len(presence_detections),
+                        len(valid_detections),
+                        median(presence_scores) * 100,
+                    )
                     selected = select_sharpest_crops(
-                        valid_detections, settings.sharpest_frames
+                        presence_detections, settings.sharpest_frames
                     )
                     frame_predictions = []
                     for bird_image, _ in selected:
