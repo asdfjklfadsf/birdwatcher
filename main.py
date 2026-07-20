@@ -637,7 +637,7 @@ def load_settings() -> AppSettings:
         sharpest_frames=int(os.getenv("SHARPEST_FRAMES", "7")),
         min_valid_bird_frames=int(os.getenv("MIN_VALID_BIRD_FRAMES", "4")),
         min_event_detector_confidence=float(
-            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.45")
+            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.30")
         ),
         detection_floor_confidence=float(
             os.getenv("DETECTION_FLOOR_CONFIDENCE", "0.05")
