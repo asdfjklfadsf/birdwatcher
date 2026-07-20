@@ -30,8 +30,8 @@ from main import (
     regional_species,
     preferred_regional_species,
     preferred_regional_species_names,
-    select_sharpest_crops,
     save_bird_image,
+    select_sharpest_crops,
     send_email,
     validate_bird_event,
     validate_settings,
@@ -196,8 +196,59 @@ class BirdWatcherTests(unittest.TestCase):
 
         crop, score = models.find_best_bird(frame, 0.35, crop_padding=0.20)
 
-        self.assertEqual(crop.shape, (70, 70, 3))
+        # Box is 50x50 (small relative to frame), so padding is adaptive and
+        # grows beyond the base 0.20; the crop fills the 100x100 frame.
+        self.assertEqual(crop.shape, (100, 100, 3))
         self.assertEqual(score, 0.90)
+
+    def test_small_bird_crop_gets_extra_padding_beyond_base(self):
+        models = object.__new__(__import__("main").BirdModels)
+        # 45x80 bird in a 1280x960 frame -> tiny box -> adaptive padding.
+        box = types.SimpleNamespace(
+            xyxy=[types.SimpleNamespace(tolist=lambda: [380, 410, 425, 490])],
+            conf=[0.90],
+        )
+        models.detector = types.SimpleNamespace(
+            predict=lambda **_kwargs: [types.SimpleNamespace(boxes=[box])]
+        )
+        frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+
+        crop, score = models.find_best_bird(frame, 0.35, crop_padding=0.20)
+
+        # Base padding would be 0.20*80=16px (crop ~77x112). Adaptive padding
+        # must produce a larger context box.
+        self.assertGreater(crop.shape[0], 112)
+        self.assertGreater(crop.shape[1], 77)
+        self.assertEqual(score, 0.90)
+
+    def test_save_bird_image_upscales_small_crops(self):
+        import tempfile
+        from pathlib import Path
+
+        resized_shapes = []
+
+        class FakeCV2WithResize:
+            INTER_LANCZOS4 = "lanczos"
+
+            @staticmethod
+            def imwrite(path, image):
+                Path(path).write_bytes(b"jpeg")
+                return True
+
+            @staticmethod
+            def resize(image, size, interpolation=None):
+                resized_shapes.append(tuple(size))
+                return np.zeros((size[1], size[0], 3), dtype=np.uint8)
+
+        small = np.zeros((77, 112, 3), dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("main.cv2", FakeCV2WithResize):
+                path = save_bird_image(small, Path(tmp), "test_species", datetime(2026, 7, 20, 14, 0, 0))
+            self.assertEqual(path.name, "20260720_140000_000000_test_species.jpg")
+            # A resize was triggered and the target short side reached 320+.
+            self.assertTrue(resized_shapes)
+            out_w, out_h = resized_shapes[0]
+            self.assertGreaterEqual(min(out_w, out_h), 320)
 
     def test_multiscale_detection_catches_small_bird_missed_by_coarse_pass(self):
         models = object.__new__(__import__("main").BirdModels)

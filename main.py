@@ -700,6 +700,23 @@ def safe_filename(value: str) -> str:
 
 def save_bird_image(image, directory: Path, species: str, observed_at: datetime) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
+    # Upscale small crops so tiny/distant birds are actually visible in the
+    # saved file and email attachment. Crops below the target short side are
+    # enlarged with LANCZOS; the scale is capped to keep files reasonable.
+    # Skipped when cv2 lacks resize (e.g. lightweight test stubs).
+    resize = getattr(cv2, "resize", None)
+    if resize is not None and hasattr(image, "shape"):
+        height, width = image.shape[:2]
+        short_side = min(height, width)
+        target_short_side = 320
+        max_long_side = 1280
+        if short_side < target_short_side:
+            scale = target_short_side / max(1, short_side)
+            if max(height, width) * scale > max_long_side:
+                scale = max_long_side / max(height, width)
+            new_width = max(1, int(round(width * scale)))
+            new_height = max(1, int(round(height * scale)))
+            image = resize(image, (new_width, new_height), interpolation=cv2.INTER_LANCZOS4)
     filename = f"{observed_at:%Y%m%d_%H%M%S_%f}_{safe_filename(species)}.jpg"
     path = directory / filename
     if not cv2.imwrite(str(path), image):
@@ -934,7 +951,15 @@ class BirdModels:
             return None
 
         _, score, x1, y1, x2, y2 = max(candidates)
-        padding = int(crop_padding * max(x2 - x1, y2 - y1))
+        box_w = x2 - x1
+        box_h = y2 - y1
+        box_dim = max(box_w, box_h)
+        # Size-adaptive padding: small/distant birds get a larger relative
+        # margin so the crop is not a postage stamp, while well-framed birds
+        # keep the configured padding. Relative padding grows as the box shrinks
+        # and never exceeds 1.0.
+        relative_padding = min(1.0, crop_padding + 0.6 * (1.0 - min(1.0, box_dim / 220.0)))
+        padding = int(relative_padding * box_dim)
         x1, y1 = max(0, x1 - padding), max(0, y1 - padding)
         x2, y2 = min(width, x2 + padding), min(height, y2 + padding)
         crop = frame[y1:y2, x1:x2].copy()
