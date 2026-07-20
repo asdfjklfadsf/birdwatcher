@@ -593,20 +593,36 @@ def save_bird_image(image, directory: Path, species: str, observed_at: datetime)
 
 def send_email(
     settings: EmailSettings,
-    species: str,
-    confidence: float,
+    identification: IdentificationResult,
     observed_at: datetime,
     image_path: Path,
 ) -> None:
     message = EmailMessage()
-    message["Subject"] = f"Bird spotted: {species}"
+    if identification.uncertain:
+        message["Subject"] = (
+            f"Bird spotted: Uncertain bird (possible {identification.candidate_name})"
+        )
+        candidates = ", ".join(
+            f"{name} {score:.1%}" for name, score in identification.top_candidates
+        )
+        message.set_content(
+            "Identification: Uncertain bird\n"
+            f"Approximate guess: {identification.candidate_name}\n"
+            f"Approximate-guess score: {identification.confidence:.1%}\n"
+            f"Agreement: {identification.votes} of {identification.frame_count} frames\n"
+            f"Top candidates: {candidates}\n"
+            "This approximate guess did not meet the certainty requirements and may be incorrect.\n"
+            f"Time: {observed_at:%Y-%m-%d %H:%M:%S}\n"
+        )
+    else:
+        message["Subject"] = f"Bird spotted: {identification.display_name}"
+        message.set_content(
+            f"Bird: {identification.display_name}\n"
+            f"Confidence: {identification.confidence:.1%}\n"
+            f"Time: {observed_at:%Y-%m-%d %H:%M:%S}\n"
+        )
     message["From"] = settings.sender
     message["To"] = settings.recipient
-    message.set_content(
-        f"Bird: {species}\n"
-        f"Confidence: {confidence:.1%}\n"
-        f"Time: {observed_at:%Y-%m-%d %H:%M:%S}\n"
-    )
     message.add_attachment(
         image_path.read_bytes(),
         maintype="image",
@@ -882,8 +898,7 @@ def run(settings: AppSettings) -> None:
                         try:
                             send_email(
                                 settings.email,
-                                identification.display_name,
-                                identification.confidence,
+                                identification,
                                 now,
                                 image_path,
                             )

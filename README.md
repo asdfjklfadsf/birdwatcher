@@ -97,7 +97,7 @@ SMTP_USE_STARTTLS=false
 - A broad safety tier contains 146 classifier labels intersected with the eBird New Jersey all-years checklist. These receive a smaller `1.5x` boost and can pass the geographic plausibility gate, preventing the short backyard list from excluding legitimate migrants, wetland birds, raptors, and uncommon visitors.
 - The eBird-derived intersection is stored locally and does not make runtime network requests. It is a broad state-level safety boundary, not a claim that every included species is common in Northern New Jersey. Species outside both tiers remain visible to the classifier but cannot be presented as certain.
 - No GPS, street address, live eBird lookup, or audio is used.
-- Weak agreement, low confidence, or a small top-two margin produces an `Uncertain bird` alert. Candidate names and scores remain available in the console log but are not presented as a reliable identification.
+- Weak agreement, low confidence, a small top-two margin, or an out-of-region winner produces an `Uncertain bird` alert. The email still includes a clearly labeled approximate guess, its score, frame agreement, and the three leading candidates, together with a warning that the estimate did not meet the certainty requirements.
 - Only the sharpest bird crop is saved, reducing background influence.
 - Detection, classification, image-save, camera-read, and SMTP failures are logged.
 - A failed frame or email does not terminate the watcher.

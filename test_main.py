@@ -15,6 +15,7 @@ from main import (
     apply_regional_prior,
     CooldownTracker,
     EmailSettings,
+    IdentificationResult,
     env_bool,
     format_species_name,
     open_camera,
@@ -226,8 +227,18 @@ class BirdWatcherTests(unittest.TestCase):
             image = Path(temp) / "bird.jpg"
             image.write_bytes(b"jpeg")
             settings = EmailSettings("smtp.example.com", 587, "user", "secret", "from@example.com", "to@example.com", False, True, False)
+            identification = IdentificationResult(
+                display_name="American Robin",
+                candidate_name="American Robin",
+                confidence=0.934,
+                margin=0.75,
+                votes=3,
+                frame_count=3,
+                uncertain=False,
+                top_candidates=(("American Robin", 0.934),),
+            )
             with patch("main.smtplib.SMTP", FakeSMTP):
-                send_email(settings, "American Robin", 0.934, datetime(2026, 7, 19, 12, 0, 0), image)
+                send_email(settings, identification, datetime(2026, 7, 19, 12, 0, 0), image)
             message = FakeSMTP.sent_message
             self.assertEqual(message["Subject"], "Bird spotted: American Robin")
             body = message.get_body(preferencelist=("plain",)).get_content()
@@ -235,6 +246,36 @@ class BirdWatcherTests(unittest.TestCase):
             self.assertIn("Confidence: 93.4%", body)
             self.assertIn("Time: 2026-07-19 12:00:00", body)
             self.assertEqual(message.get_payload()[-1].get_filename(), "bird.jpg")
+
+    def test_uncertain_email_includes_an_explicit_approximate_guess(self):
+        with TemporaryDirectory() as temp:
+            image = Path(temp) / "bird.jpg"
+            image.write_bytes(b"jpeg")
+            settings = EmailSettings("smtp.example.com", 587, "user", "secret", "from@example.com", "to@example.com", False, True, False)
+            identification = IdentificationResult(
+                display_name="Uncertain bird",
+                candidate_name="Northern Cardinal",
+                confidence=0.55,
+                margin=0.25,
+                votes=3,
+                frame_count=3,
+                uncertain=True,
+                top_candidates=(("Northern Cardinal", 0.55), ("House Finch", 0.30), ("House Sparrow", 0.15)),
+            )
+            with patch("main.smtplib.SMTP", FakeSMTP):
+                send_email(settings, identification, datetime(2026, 7, 19, 12, 0, 0), image)
+            message = FakeSMTP.sent_message
+            self.assertEqual(
+                message["Subject"],
+                "Bird spotted: Uncertain bird (possible Northern Cardinal)",
+            )
+            body = message.get_body(preferencelist=("plain",)).get_content()
+            self.assertIn("Identification: Uncertain bird", body)
+            self.assertIn("Approximate guess: Northern Cardinal", body)
+            self.assertIn("Approximate-guess score: 55.0%", body)
+            self.assertIn("Agreement: 3 of 3 frames", body)
+            self.assertIn("Top candidates: Northern Cardinal 55.0%, House Finch 30.0%, House Sparrow 15.0%", body)
+            self.assertIn("This approximate guess did not meet the certainty requirements", body)
 
     def test_invalid_boolean_is_rejected(self):
         with patch.dict("os.environ", {"TEST_BOOLEAN": "tru"}):
