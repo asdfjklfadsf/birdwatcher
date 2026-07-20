@@ -51,7 +51,8 @@ Press `Ctrl+C` to stop. The first run requires internet access to download the p
 | `BURST_FRAME_INTERVAL_SECONDS` | `1.0` | Delay between observation samples; nine samples span about eight seconds |
 | `SHARPEST_FRAMES` | `7` | Sharpest detected crops used for identification |
 | `MIN_VALID_BIRD_FRAMES` | `4` | Minimum repeated, plausibly shaped detections required before any image can be saved or emailed |
-| `MIN_EVENT_DETECTOR_CONFIDENCE` | `0.45` | Minimum median YOLO confidence across the accepted event detections |
+| `MIN_EVENT_DETECTOR_CONFIDENCE` | `0.07` | Minimum median YOLO confidence across the accepted event detections |
+| `DETECTION_FLOOR_CONFIDENCE` | `0.05` | Lowest YOLO confidence the multi-scale sweep will accept for small or distant birds; must not exceed `MIN_EVENT_DETECTOR_CONFIDENCE` |
 | `MAX_BIRD_CROP_ASPECT_RATIO` | `2.5` | Reject extremely wide or tall crops, including the feeder suction-cup false positive |
 | `CONSENSUS_MIN_VOTES` | `4` | Required agreeing top predictions among selected crops |
 | `SPECIES_MIN_CONFIDENCE` | `0.60` | Minimum aggregate hybrid evidence score for a definite name; still requires 4-of-7 votes and the margin gate |

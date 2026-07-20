@@ -430,6 +430,7 @@ class AppSettings:
     sharpest_frames: int
     min_valid_bird_frames: int
     min_event_detector_confidence: float
+    detection_floor_confidence: float
     max_bird_crop_aspect_ratio: float
     consensus_min_votes: int
     species_min_confidence: float
@@ -554,6 +555,12 @@ def validate_settings(settings: AppSettings) -> None:
         raise ValueError("MIN_VALID_BIRD_FRAMES must be between 1 and BURST_FRAMES")
     if not 0 < settings.min_event_detector_confidence <= 1:
         raise ValueError("MIN_EVENT_DETECTOR_CONFIDENCE must be greater than 0 and at most 1")
+    if not 0 < settings.detection_floor_confidence <= 1:
+        raise ValueError("DETECTION_FLOOR_CONFIDENCE must be greater than 0 and at most 1")
+    if settings.detection_floor_confidence > settings.min_event_detector_confidence:
+        raise ValueError(
+            "DETECTION_FLOOR_CONFIDENCE must not exceed MIN_EVENT_DETECTOR_CONFIDENCE"
+        )
     if (
         not math.isfinite(settings.max_bird_crop_aspect_ratio)
         or settings.max_bird_crop_aspect_ratio < 1
@@ -622,7 +629,10 @@ def load_settings() -> AppSettings:
         sharpest_frames=int(os.getenv("SHARPEST_FRAMES", "7")),
         min_valid_bird_frames=int(os.getenv("MIN_VALID_BIRD_FRAMES", "4")),
         min_event_detector_confidence=float(
-            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.45")
+            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.07")
+        ),
+        detection_floor_confidence=float(
+            os.getenv("DETECTION_FLOOR_CONFIDENCE", "0.05")
         ),
         max_bird_crop_aspect_ratio=float(os.getenv("MAX_BIRD_CROP_ASPECT_RATIO", "2.5")),
         consensus_min_votes=int(os.getenv("CONSENSUS_MIN_VOTES", "4")),
@@ -832,38 +842,94 @@ class BirdModels:
         self._local_text_cache = {}
         LOG.info("Models ready; species classifiers device: %s", self.device)
 
+    def _collect_bird_boxes(self, frame, imgsz: int, confidence: float):
+        """Run YOLO on one view of the frame and return (x1, y1, x2, y2, score)."""
+        results = self.detector.predict(
+            source=frame,
+            classes=[14],  # COCO class 14 is bird.
+            conf=confidence,
+            imgsz=imgsz,
+            verbose=False,
+        )
+        boxes = []
+        for box in results[0].boxes:
+            x1, y1, x2, y2 = (int(value) for value in box.xyxy[0].tolist())
+            score = float(box.conf[0])
+            boxes.append((x1, y1, x2, y2, score))
+        return boxes
+
     def find_best_bird(
         self,
         frame,
         confidence: float,
         crop_padding: float = 0.08,
         max_aspect_ratio: float = math.inf,
+        multiscale: bool = True,
+        tile_grid: int = 3,
+        high_res: int = 1280,
+        low_confidence: float = 0.05,
     ):
-        """Return (cropped bird image, detector confidence), or None."""
+        """Return (cropped bird image, detector confidence), or None.
+
+        The cheap full-frame pass at ``confidence`` runs first. When it finds
+        nothing, a higher-resolution full-frame pass plus a ``tile_grid`` x
+        ``tile_grid`` tile sweep at ``low_confidence`` hunts small or distant
+        birds that the coarse pass misses. The multi-scale sweep only runs when
+        the cheap pass is empty, so close birds cost a single inference.
+        """
         if not math.isfinite(crop_padding) or not 0 <= crop_padding <= 1:
             raise ValueError("Bird crop padding must be between 0 and 1")
         if max_aspect_ratio < 1:
             raise ValueError("Maximum bird-box aspect ratio must be at least 1")
-        results = self.detector.predict(
-            source=frame,
-            classes=[14],  # COCO class 14 is bird.
-            conf=confidence,
-            verbose=False,
-        )
-        candidates = []
+        if tile_grid < 1:
+            raise ValueError("Detection tile grid must be at least 1")
+        if high_res < 1:
+            raise ValueError("Detection high-res image size must be positive")
+        if not math.isfinite(low_confidence) or not 0 <= low_confidence <= 1:
+            raise ValueError("Low-confidence detection floor must be between 0 and 1")
+
         height, width = frame.shape[:2]
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = (int(value) for value in box.xyxy[0].tolist())
-            score = float(box.conf[0])
+        candidates = []
+
+        def accept(x1, y1, x2, y2, score):
             box_width = max(0, x2 - x1)
             box_height = max(0, y2 - y1)
             if box_width == 0 or box_height == 0:
-                continue
+                return None
             aspect_ratio = max(box_width / box_height, box_height / box_width)
             if aspect_ratio > max_aspect_ratio:
-                continue
-            area = box_width * box_height
-            candidates.append((area * score, score, x1, y1, x2, y2))
+                return None
+            return (box_width * box_height * score, score, x1, y1, x2, y2)
+
+        # Cheap primary pass at the configured confidence.
+        for x1, y1, x2, y2, score in self._collect_bird_boxes(frame, 640, confidence):
+            candidate = accept(x1, y1, x2, y2, score)
+            if candidate is not None:
+                candidates.append(candidate)
+
+        # Expensive multi-scale sweep only when the cheap pass found nothing.
+        if not candidates and multiscale:
+            for x1, y1, x2, y2, score in self._collect_bird_boxes(frame, high_res, low_confidence):
+                candidate = accept(x1, y1, x2, y2, score)
+                if candidate is not None:
+                    candidates.append(candidate)
+            if tile_grid > 1:
+                for ty in range(tile_grid):
+                    for tx in range(tile_grid):
+                        y0 = int(ty * height / tile_grid)
+                        y1t = int((ty + 1) * height / tile_grid)
+                        x0 = int(tx * width / tile_grid)
+                        x1t = int((tx + 1) * width / tile_grid)
+                        tile = frame[y0:y1t, x0:x1t]
+                        if tile.size == 0:
+                            continue
+                        for lx1, ly1, lx2, ly2, score in self._collect_bird_boxes(
+                            tile, 640, low_confidence
+                        ):
+                            candidate = accept(x0 + lx1, y0 + ly1, x0 + lx2, y0 + ly2, score)
+                            if candidate is not None:
+                                candidates.append(candidate)
+
         if not candidates:
             return None
 
@@ -954,6 +1020,7 @@ def collect_bird_crops(
     frame_interval: float = 0.0,
     crop_padding: float = 0.08,
     max_aspect_ratio: float = math.inf,
+    detection_floor_confidence: float = 0.05,
 ):
     if not math.isfinite(frame_interval) or frame_interval < 0:
         raise ValueError("BURST_FRAME_INTERVAL_SECONDS must be finite and nonnegative")
@@ -971,6 +1038,7 @@ def collect_bird_crops(
                 detection_confidence,
                 crop_padding,
                 max_aspect_ratio,
+                low_confidence=detection_floor_confidence,
             )
         except Exception:
             LOG.exception("Bird detection failed on a burst frame; skipping frame")
@@ -1099,6 +1167,7 @@ def run(settings: AppSettings) -> None:
                     settings.detection_confidence,
                     settings.crop_padding,
                     settings.max_bird_crop_aspect_ratio,
+                    low_confidence=settings.detection_floor_confidence,
                 )
                 if detection is not None:
                     now = datetime.now().astimezone()
@@ -1123,6 +1192,7 @@ def run(settings: AppSettings) -> None:
                         settings.burst_frame_interval,
                         settings.crop_padding,
                         settings.max_bird_crop_aspect_ratio,
+                        settings.detection_floor_confidence,
                     )
                     valid_detections, rejection_reason = validate_bird_event(
                         burst_detections,

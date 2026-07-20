@@ -165,7 +165,7 @@ class BirdWatcherTests(unittest.TestCase):
                 return True, next(self.frames)
 
         class FakeModels:
-            def find_best_bird(self, frame, confidence, crop_padding, max_aspect_ratio):
+            def find_best_bird(self, frame, confidence, crop_padding, max_aspect_ratio, **_kwargs):
                 self.detection_settings = (crop_padding, max_aspect_ratio)
                 return (f"crop-{frame}", confidence)
 
@@ -198,6 +198,32 @@ class BirdWatcherTests(unittest.TestCase):
 
         self.assertEqual(crop.shape, (70, 70, 3))
         self.assertEqual(score, 0.90)
+
+    def test_multiscale_detection_catches_small_bird_missed_by_coarse_pass(self):
+        models = object.__new__(__import__("main").BirdModels)
+        small_box = types.SimpleNamespace(
+            xyxy=[types.SimpleNamespace(tolist=lambda: [380, 410, 425, 490])],
+            conf=[0.075],
+        )
+
+        def predict(source=None, **kwargs):
+            imgsz = kwargs.get("imgsz", 640)
+            conf = kwargs.get("conf", 0.35)
+            # Cheap 640 pass misses the small bird; the high-res pass finds it.
+            if imgsz == 640 and conf >= 0.35:
+                return [types.SimpleNamespace(boxes=[])]
+            if imgsz == 1280:
+                return [types.SimpleNamespace(boxes=[small_box])]
+            return [types.SimpleNamespace(boxes=[])]
+
+        models.detector = types.SimpleNamespace(predict=predict)
+        frame = np.zeros((960, 1280, 3), dtype=np.uint8)
+
+        detection = models.find_best_bird(frame, 0.35, low_confidence=0.05)
+
+        self.assertIsNotNone(detection)
+        crop, score = detection
+        self.assertAlmostEqual(score, 0.075)
 
     def test_bird_event_gate_rejects_single_frame_false_positive(self):
         class Crop:
@@ -281,6 +307,7 @@ class BirdWatcherTests(unittest.TestCase):
                 sharpest_frames=7,
                 min_valid_bird_frames=4,
                 min_event_detector_confidence=0.45,
+                detection_floor_confidence=0.10,
                 max_bird_crop_aspect_ratio=2.5,
                 consensus_min_votes=4,
                 species_min_confidence=0.60,
@@ -529,6 +556,7 @@ class BirdWatcherTests(unittest.TestCase):
             sharpest_frames=7,
             min_valid_bird_frames=4,
             min_event_detector_confidence=0.45,
+            detection_floor_confidence=0.10,
             max_bird_crop_aspect_ratio=2.5,
             consensus_min_votes=2,
             species_min_confidence=0.70,
@@ -564,6 +592,7 @@ class BirdWatcherTests(unittest.TestCase):
             sharpest_frames=7,
             min_valid_bird_frames=4,
             min_event_detector_confidence=0.45,
+            detection_floor_confidence=0.10,
             max_bird_crop_aspect_ratio=2.5,
             consensus_min_votes=2,
             species_min_confidence=0.70,
