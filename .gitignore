@@ -1,4 +1,5 @@
 .env
+.env.*
 .venv/
 bird_images/
 __pycache__/
