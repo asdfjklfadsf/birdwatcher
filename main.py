@@ -278,10 +278,15 @@ def _validate_region_profile(profile: str) -> str:
     return normalized_profile
 
 
+def preferred_regional_species_names(profile: str, month: int) -> set[str]:
+    """Return human-readable common/resident species for local visual retrieval."""
+    _validate_region_profile(profile)
+    return _NORTHERN_NJ_RESIDENTS | _NORTHERN_NJ_SEASONAL[season_for_month(month)]
+
+
 def preferred_regional_species(profile: str, month: int) -> set[str]:
     """Return supported common/resident labels that receive the seasonal boost."""
-    _validate_region_profile(profile)
-    names = _NORTHERN_NJ_RESIDENTS | _NORTHERN_NJ_SEASONAL[season_for_month(month)]
+    names = preferred_regional_species_names(profile, month)
     aliases = {species_key("Tufted Titmouse"): species_key("Tit Mouse")}
     preferred = {aliases.get(species_key(name), species_key(name)) for name in names}
     supported = {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
@@ -289,10 +294,17 @@ def preferred_regional_species(profile: str, month: int) -> set[str]:
 
 
 def regional_species(profile: str, month: int) -> set[str]:
-    """Return broad NJ-documented model labels used only as a plausibility gate."""
+    """Return broad NJ-documented legacy-model labels used for regional evidence."""
     _validate_region_profile(profile)
     season_for_month(month)
     return {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
+
+
+def identification_plausible_species(profile: str, month: int) -> set[str]:
+    """Return the union of broad legacy labels and valid local BioCLIP names."""
+    return regional_species(profile, month) | {
+        species_key(name) for name in preferred_regional_species_names(profile, month)
+    }
 
 
 def apply_regional_prior(
@@ -325,6 +337,66 @@ def apply_regional_prior(
     if total <= 0:
         raise ValueError("Prediction scores must have a positive sum")
     return sorted(((label, score / total) for label, score in weighted), key=lambda item: -item[1])
+
+
+def combine_classifier_predictions(
+    local_predictions: list[tuple[str, float]],
+    global_predictions: list[tuple[str, float]],
+    local_weight: float,
+) -> list[tuple[str, float]]:
+    """Blend local-feeder and broad classifier evidence without deleting either."""
+    if not local_predictions or not global_predictions:
+        raise ValueError("Both classifier prediction lists must be nonempty")
+    if not math.isfinite(local_weight) or not 0 <= local_weight <= 1:
+        raise ValueError("LOCAL_CLASSIFIER_WEIGHT must be between 0 and 1")
+
+    scores: defaultdict[str, float] = defaultdict(float)
+    labels: dict[str, str] = {}
+    for predictions, weight in (
+        (global_predictions, 1.0 - local_weight),
+        (local_predictions, local_weight),
+    ):
+        for label, score in predictions:
+            key = species_key(label)
+            labels[key] = label
+            scores[key] += weight * score
+
+    total = sum(scores.values())
+    if total <= 0:
+        raise ValueError("Combined classifier scores must have a positive sum")
+    return sorted(
+        ((labels[key], score / total) for key, score in scores.items()),
+        key=lambda item: (-item[1], item[0]),
+    )
+
+
+def hybrid_species_predictions(
+    models,
+    bird_image,
+    preferred_names: set[str],
+    preferred_keys: set[str],
+    plausible_keys: set[str],
+    regional_weight: float,
+    local_weight: float,
+) -> list[tuple[str, float]]:
+    """Blend BioCLIP local evidence with the broad 525-label classifier."""
+    global_predictions = apply_regional_prior(
+        models.identify_species_candidates(bird_image, top_k=20),
+        preferred_keys,
+        regional_weight,
+        plausible_species=plausible_keys,
+        plausible_weight=1.5,
+    )
+    local_predictions = models.identify_local_species_candidates(
+        bird_image,
+        preferred_names,
+        top_k=len(preferred_names),
+    )
+    return combine_classifier_predictions(
+        local_predictions,
+        global_predictions,
+        local_weight,
+    )
 
 
 @dataclass(frozen=True)
@@ -362,6 +434,9 @@ class AppSettings:
     detector_sha256: str
     classifier_model: str
     classifier_revision: str
+    local_classifier_model: str
+    local_classifier_revision: str
+    local_classifier_weight: float
 
 
 @dataclass(frozen=True)
@@ -489,6 +564,10 @@ def validate_settings(settings: AppSettings) -> None:
         raise ValueError("DETECTOR_MODEL_SHA256 must contain exactly 64 hexadecimal characters")
     if not settings.classifier_revision:
         raise ValueError("CLASSIFIER_REVISION is required")
+    if not settings.local_classifier_model or not settings.local_classifier_revision:
+        raise ValueError("LOCAL_CLASSIFIER_MODEL and LOCAL_CLASSIFIER_REVISION are required")
+    if not math.isfinite(settings.local_classifier_weight) or not 0 <= settings.local_classifier_weight <= 1:
+        raise ValueError("LOCAL_CLASSIFIER_WEIGHT must be between 0 and 1")
 
 
 def load_settings() -> AppSettings:
@@ -541,6 +620,12 @@ def load_settings() -> AppSettings:
             "CLASSIFIER_REVISION",
             "558944ca4448f5b311af8393c8b894eff20a06da",
         ),
+        local_classifier_model=os.getenv("LOCAL_CLASSIFIER_MODEL", "imageomics/bioclip"),
+        local_classifier_revision=os.getenv(
+            "LOCAL_CLASSIFIER_REVISION",
+            "ce901ab3c6a913f9e9ef94ce6d27761069f4f01c",
+        ),
+        local_classifier_weight=float(os.getenv("LOCAL_CLASSIFIER_WEIGHT", "0.65")),
     )
     validate_settings(settings)
     return settings
@@ -678,8 +763,12 @@ class BirdModels:
         detector_sha256: str,
         classifier_name: str,
         classifier_revision: str,
+        local_classifier_name: str = "imageomics/bioclip",
+        local_classifier_revision: str = "ce901ab3c6a913f9e9ef94ce6d27761069f4f01c",
     ):
+        import open_clip
         import torch
+        from huggingface_hub import snapshot_download
         from transformers import AutoImageProcessor, AutoModelForImageClassification
         from ultralytics import YOLO
 
@@ -697,7 +786,30 @@ class BirdModels:
         self.torch = torch
         self.device = torch.device("cpu")
         self.classifier.to(self.device)
-        LOG.info("Models ready; species classifier device: %s", self.device)
+        LOG.info("Loading local BioCLIP classifier: %s", local_classifier_name)
+        local_snapshot = snapshot_download(
+            repo_id=local_classifier_name,
+            revision=local_classifier_revision,
+            allow_patterns=[
+                "open_clip_config.json",
+                "open_clip_pytorch_model.bin",
+                "merges.txt",
+                "vocab.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "special_tokens_map.json",
+            ],
+        )
+        local_source = f"local-dir:{local_snapshot}"
+        self.local_classifier, _, self.local_preprocess = open_clip.create_model_and_transforms(
+            local_source,
+            require_pretrained=True,
+            weights_only=True,
+        )
+        self.local_tokenizer = open_clip.get_tokenizer(local_source)
+        self.local_classifier.eval().to(self.device)
+        self._local_text_cache = {}
+        LOG.info("Models ready; species classifiers device: %s", self.device)
 
     def find_best_bird(self, frame, confidence: float):
         """Return (cropped bird image, detector confidence), or None."""
@@ -748,6 +860,52 @@ class BirdModels:
     def identify_species(self, bird_image) -> tuple[str, float]:
         return self.identify_species_candidates(bird_image, top_k=1)[0]
 
+    def identify_local_species_candidates(
+        self,
+        bird_image,
+        species_names: set[str],
+        top_k: int = 20,
+    ) -> list[tuple[str, float]]:
+        """Classify among common local/seasonal species with pinned BioCLIP."""
+        from PIL import Image
+
+        names = tuple(sorted(species_names))
+        if not names:
+            raise ValueError("Local classifier requires at least one species name")
+        text_features = self._local_text_cache.get(names)
+        if text_features is None:
+            templates = (
+                "a photo of a {}.",
+                "a cropped photo of a {}.",
+                "a close-up photo of a {}.",
+                "a photo of the {}.",
+                "a blurry photo of a {}.",
+            )
+            prompts = [template.format(name) for name in names for template in templates]
+            with self.torch.inference_mode():
+                features = self.local_classifier.encode_text(
+                    self.local_tokenizer(prompts).to(self.device)
+                )
+                features = features / features.norm(dim=-1, keepdim=True)
+                features = features.reshape(len(names), len(templates), -1).mean(dim=1)
+                features = features / features.norm(dim=-1, keepdim=True)
+                text_features = features.T.contiguous()
+            self._local_text_cache[names] = text_features
+
+        rgb_image = cv2.cvtColor(bird_image, cv2.COLOR_BGR2RGB)
+        image_tensor = self.local_preprocess(Image.fromarray(rgb_image)).unsqueeze(0).to(self.device)
+        with self.torch.inference_mode():
+            image_features = self.local_classifier.encode_image(image_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            logits = self.local_classifier.logit_scale.exp() * image_features @ text_features
+            probabilities = self.torch.softmax(logits, dim=-1)[0]
+            count = min(top_k, len(names))
+            confidences, class_ids = self.torch.topk(probabilities, count)
+        return [
+            (names[int(class_id)], float(confidence))
+            for confidence, class_id in zip(confidences.tolist(), class_ids.tolist())
+        ]
+
 
 def collect_bird_crops(
     capture,
@@ -793,6 +951,8 @@ def run(settings: AppSettings) -> None:
         settings.detector_sha256,
         settings.classifier_model,
         settings.classifier_revision,
+        settings.local_classifier_model,
+        settings.local_classifier_revision,
     )
     cooldown = CooldownTracker(settings.cooldown, settings.image_dir / ".last_alert")
     capture = None
@@ -805,6 +965,11 @@ def run(settings: AppSettings) -> None:
         len(preferred_regional_species(settings.region_profile, datetime.now().astimezone().month)),
         settings.regional_prior_weight,
         len(regional_species(settings.region_profile, datetime.now().astimezone().month)),
+    )
+    LOG.info(
+        "Hybrid species identification: %.0f%% BioCLIP local/seasonal + %.0f%% broad 525-label classifier",
+        settings.local_classifier_weight * 100,
+        (1.0 - settings.local_classifier_weight) * 100,
     )
 
     try:
@@ -838,8 +1003,14 @@ def run(settings: AppSettings) -> None:
                 detection = models.find_best_bird(frame, settings.detection_confidence)
                 if detection is not None:
                     now = datetime.now().astimezone()
-                    plausible = regional_species(settings.region_profile, now.month)
+                    broad = regional_species(settings.region_profile, now.month)
+                    plausible = identification_plausible_species(
+                        settings.region_profile, now.month
+                    )
                     preferred = preferred_regional_species(settings.region_profile, now.month)
+                    preferred_names = preferred_regional_species_names(
+                        settings.region_profile, now.month
+                    )
                     burst_detections = collect_bird_crops(
                         capture,
                         models,
@@ -850,14 +1021,15 @@ def run(settings: AppSettings) -> None:
                     selected = select_sharpest_crops(burst_detections, settings.sharpest_frames)
                     frame_predictions = []
                     for bird_image, _ in selected:
-                        raw_predictions = models.identify_species_candidates(bird_image, top_k=20)
                         frame_predictions.append(
-                            apply_regional_prior(
-                                raw_predictions,
+                            hybrid_species_predictions(
+                                models,
+                                bird_image,
+                                preferred_names,
                                 preferred,
+                                broad,
                                 settings.regional_prior_weight,
-                                plausible_species=plausible,
-                                plausible_weight=1.5,
+                                settings.local_classifier_weight,
                             )[:3]
                         )
                     identification = resolve_identification(

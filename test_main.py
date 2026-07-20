@@ -13,16 +13,20 @@ for name in ("cv2", "torch", "transformers", "ultralytics"):
 from main import (
     AppSettings,
     apply_regional_prior,
+    combine_classifier_predictions,
     CooldownTracker,
     EmailSettings,
     IdentificationResult,
     env_bool,
+    hybrid_species_predictions,
+    identification_plausible_species,
     format_species_name,
     open_camera,
     season_for_month,
     resolve_identification,
     regional_species,
     preferred_regional_species,
+    preferred_regional_species_names,
     select_sharpest_crops,
     save_bird_image,
     send_email,
@@ -96,6 +100,57 @@ class BirdWatcherTests(unittest.TestCase):
             plausible_weight=1.5,
         )
         self.assertEqual(adjusted[0][0], "Osprey")
+
+    def test_hybrid_classifier_blends_local_evidence_without_deleting_unusual_species(self):
+        combined = combine_classifier_predictions(
+            local_predictions=[("House Finch", 0.80), ("House Sparrow", 0.20)],
+            global_predictions=[("African Firefinch", 0.70), ("House Finch", 0.30)],
+            local_weight=0.65,
+        )
+        self.assertEqual(combined[0][0], "House Finch")
+        self.assertAlmostEqual(sum(score for _, score in combined), 1.0)
+        self.assertIn("African Firefinch", [name for name, _ in combined])
+        self.assertAlmostEqual(dict(combined)["House Finch"], 0.625)
+        self.assertAlmostEqual(dict(combined)["African Firefinch"], 0.245)
+
+    def test_local_classifier_names_follow_the_active_season(self):
+        summer = preferred_regional_species_names("northern_nj", 7)
+        winter = preferred_regional_species_names("northern_nj", 1)
+        self.assertIn("Northern Cardinal", summer)
+        self.assertIn("Brown-Headed Cowbird", summer)
+        self.assertNotIn("Brown-Headed Cowbird", winter)
+        self.assertIn("Dark-Eyed Junco", winter)
+
+    def test_local_species_missing_from_legacy_labels_still_pass_plausibility(self):
+        broad = regional_species("northern_nj", 7)
+        plausible = identification_plausible_species("northern_nj", 7)
+        self.assertNotIn("carolinawren", broad)
+        self.assertIn("carolinawren", plausible)
+
+    def test_hybrid_path_uses_local_and_global_model_evidence(self):
+        class FakeModels:
+            def identify_species_candidates(self, bird_image, top_k=20):
+                self.global_call = (bird_image, top_k)
+                return [("African Firefinch", 0.70), ("House Finch", 0.30)]
+
+            def identify_local_species_candidates(self, bird_image, species_names, top_k=20):
+                self.local_call = (bird_image, species_names, top_k)
+                return [("House Finch", 0.80), ("House Sparrow", 0.20)]
+
+        models = FakeModels()
+        predictions = hybrid_species_predictions(
+            models=models,
+            bird_image="crop",
+            preferred_names={"House Finch", "House Sparrow"},
+            preferred_keys={"housefinch", "housesparrow"},
+            plausible_keys={"housefinch", "housesparrow"},
+            regional_weight=3.0,
+            local_weight=0.65,
+        )
+        self.assertEqual(predictions[0][0], "House Finch")
+        self.assertEqual(models.global_call, ("crop", 20))
+        self.assertEqual(models.local_call, ("crop", {"House Finch", "House Sparrow"}, 2))
+        self.assertIn("African Firefinch", [name for name, _ in predictions])
 
     def test_consensus_accepts_agreeing_high_quality_predictions(self):
         result = resolve_identification(
@@ -305,6 +360,9 @@ class BirdWatcherTests(unittest.TestCase):
             detector_sha256="a" * 64,
             classifier_model="classifier",
             classifier_revision="b" * 40,
+            local_classifier_model="imageomics/bioclip",
+            local_classifier_revision="c" * 40,
+            local_classifier_weight=0.65,
         )
         with self.assertRaisesRegex(ValueError, "plaintext SMTP"):
             validate_settings(settings)
@@ -332,6 +390,9 @@ class BirdWatcherTests(unittest.TestCase):
             detector_sha256="a" * 64,
             classifier_model="classifier",
             classifier_revision="b" * 40,
+            local_classifier_model="imageomics/bioclip",
+            local_classifier_revision="c" * 40,
+            local_classifier_weight=0.65,
         )
         with self.assertRaises(ValueError):
             validate_settings(settings)
