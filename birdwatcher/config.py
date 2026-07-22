@@ -50,12 +50,12 @@ def load_runtime_config() -> RuntimeConfig:
     if missing:
         raise ValueError(f"Missing required .env settings: {', '.join(missing)}")
 
-    # COOLDOWN_MINUTES remains a backwards-compatible alias for the maximum age
-    # of one continuously active bird event. It is no longer keyed by species.
     max_event_minutes = float(
         os.getenv("ACTIVE_EVENT_MAX_MINUTES", os.getenv("COOLDOWN_MINUTES", "10"))
     )
-    event_clear_seconds = float(os.getenv("EVENT_CLEAR_SECONDS", "3"))
+    # Six seconds tolerates short detector dropouts without keeping departed birds
+    # suppressed for an excessive amount of time. It remains fully configurable.
+    event_clear_seconds = float(os.getenv("EVENT_CLEAR_SECONDS", "6"))
     if not math.isfinite(max_event_minutes) or max_event_minutes <= 0:
         raise ValueError("ACTIVE_EVENT_MAX_MINUTES must be finite and greater than zero")
     if not math.isfinite(event_clear_seconds) or event_clear_seconds <= 0:
@@ -75,9 +75,7 @@ def load_runtime_config() -> RuntimeConfig:
         burst_frame_interval=float(os.getenv("BURST_FRAME_INTERVAL_SECONDS", "1.0")),
         sharpest_frames=int(os.getenv("SHARPEST_FRAMES", "7")),
         min_valid_bird_frames=int(os.getenv("MIN_VALID_BIRD_FRAMES", "4")),
-        min_event_detector_confidence=float(
-            os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.07")
-        ),
+        min_event_detector_confidence=float(os.getenv("MIN_EVENT_DETECTOR_CONFIDENCE", "0.07")),
         detection_floor_confidence=float(os.getenv("DETECTION_FLOOR_CONFIDENCE", "0.05")),
         max_bird_crop_aspect_ratio=float(os.getenv("MAX_BIRD_CROP_ASPECT_RATIO", "2.5")),
         min_bird_presence_score=float(os.getenv("MIN_BIRD_PRESENCE_SCORE", "0.50")),
@@ -95,13 +93,11 @@ def load_runtime_config() -> RuntimeConfig:
         ),
         classifier_model=os.getenv("CLASSIFIER_MODEL", "chriamue/bird-species-classifier"),
         classifier_revision=os.getenv(
-            "CLASSIFIER_REVISION",
-            "558944ca4448f5b311af8393c8b894eff20a06da",
+            "CLASSIFIER_REVISION", "558944ca4448f5b311af8393c8b894eff20a06da"
         ),
         local_classifier_model=os.getenv("LOCAL_CLASSIFIER_MODEL", "imageomics/bioclip"),
         local_classifier_revision=os.getenv(
-            "LOCAL_CLASSIFIER_REVISION",
-            "ce901ab3c6a913f9e9ef94ce6d27761069f4f01c",
+            "LOCAL_CLASSIFIER_REVISION", "ce901ab3c6a913f9e9ef94ce6d27761069f4f01c"
         ),
         local_classifier_weight=float(os.getenv("LOCAL_CLASSIFIER_WEIGHT", "0.65")),
     )
