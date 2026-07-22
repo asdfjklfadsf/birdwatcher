@@ -9,34 +9,32 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-import legacy_main as core
+from .domain import AppSettings, EmailSettings
+from .settings import env_bool, validate_settings
 
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    """Validated application settings plus event-deduplication controls."""
-
-    settings: core.AppSettings
+    settings: AppSettings
     event_clear_seconds: float
     active_event_max_age: timedelta
 
 
 def load_runtime_config() -> RuntimeConfig:
-    """Load .env without pre-populating values that would block dotenv overrides."""
     load_dotenv()
 
     camera_value = os.getenv("CAMERA", "0").strip()
     camera: int | str = int(camera_value) if camera_value.isdigit() else camera_value
-    email = core.EmailSettings(
+    email = EmailSettings(
         host=os.getenv("SMTP_HOST", "").strip(),
         port=int(os.getenv("SMTP_PORT", "587")),
         username=os.getenv("SMTP_USERNAME", "").strip(),
         password=os.getenv("SMTP_PASSWORD", ""),
         sender=os.getenv("EMAIL_FROM", "").strip(),
         recipient=os.getenv("EMAIL_TO", "").strip(),
-        use_ssl=core.env_bool("SMTP_USE_SSL", False),
-        use_starttls=core.env_bool("SMTP_USE_STARTTLS", True),
-        allow_insecure=core.env_bool("SMTP_ALLOW_INSECURE", False),
+        use_ssl=env_bool("SMTP_USE_SSL", False),
+        use_starttls=env_bool("SMTP_USE_STARTTLS", True),
+        allow_insecure=env_bool("SMTP_ALLOW_INSECURE", False),
     )
     missing = [
         name
@@ -53,15 +51,13 @@ def load_runtime_config() -> RuntimeConfig:
     max_event_minutes = float(
         os.getenv("ACTIVE_EVENT_MAX_MINUTES", os.getenv("COOLDOWN_MINUTES", "10"))
     )
-    # Six seconds tolerates short detector dropouts without keeping departed birds
-    # suppressed for an excessive amount of time. It remains fully configurable.
     event_clear_seconds = float(os.getenv("EVENT_CLEAR_SECONDS", "6"))
     if not math.isfinite(max_event_minutes) or max_event_minutes <= 0:
         raise ValueError("ACTIVE_EVENT_MAX_MINUTES must be finite and greater than zero")
     if not math.isfinite(event_clear_seconds) or event_clear_seconds <= 0:
         raise ValueError("EVENT_CLEAR_SECONDS must be finite and greater than zero")
 
-    settings = core.AppSettings(
+    settings = AppSettings(
         camera=camera,
         camera_width=int(os.getenv("CAMERA_WIDTH", "1280")),
         camera_height=int(os.getenv("CAMERA_HEIGHT", "960")),
@@ -101,7 +97,7 @@ def load_runtime_config() -> RuntimeConfig:
         ),
         local_classifier_weight=float(os.getenv("LOCAL_CLASSIFIER_WEIGHT", "0.65")),
     )
-    core.validate_settings(settings)
+    validate_settings(settings)
     return RuntimeConfig(
         settings=settings,
         event_clear_seconds=event_clear_seconds,

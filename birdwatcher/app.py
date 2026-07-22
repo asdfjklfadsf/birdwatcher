@@ -6,20 +6,39 @@ import time
 from datetime import datetime
 from typing import Callable
 
-import legacy_main as core
-
 from .alerts import EmailRetryQueue, send_or_queue
 from .classification import encode_accepted_crops, hybrid_predictions
 from .config import RuntimeConfig, load_runtime_config
+from .emailer import send_email
+from .media import image_sharpness, open_camera, save_bird_image
+from .models import BirdModels
+from .region import (
+    identification_plausible_species,
+    preferred_regional_species,
+    preferred_regional_species_names,
+    regional_species,
+    resolve_identification,
+)
 from .tracking import ActiveEventTracker, choose_initial_detection, collect_tracked_crops, detect_birds
+from .validation import validate_bird_event
 
 LOG = logging.getLogger("bird_watcher")
 
 
-def process_new_event(capture, models, initial, settings, active_events: ActiveEventTracker, event_time: datetime, *, retry_queue: EmailRetryQueue | None = None, clock_fn: Callable[[], float] = time.monotonic) -> bool:
+def process_new_event(
+    capture,
+    models,
+    initial,
+    settings,
+    active_events: ActiveEventTracker,
+    event_time: datetime,
+    *,
+    retry_queue: EmailRetryQueue | None = None,
+    clock_fn: Callable[[], float] = time.monotonic,
+) -> bool:
     """Validate, classify, save, and alert once for one newly observed bird event."""
     tracked = collect_tracked_crops(capture, models, initial, settings)
-    valid, reason = core.validate_bird_event(
+    valid, reason = validate_bird_event(
         [(item.crop, item.score) for item in tracked],
         settings.min_valid_bird_frames,
         settings.min_event_detector_confidence,
@@ -36,53 +55,73 @@ def process_new_event(capture, models, initial, settings, active_events: ActiveE
         LOG.info("Suppressed bird event: only %d crop(s) passed BioCLIP presence gate", len(encoded))
         return False
 
+    confirmed_box = encoded[-1].detection.box
     previous_box = encoded[-2].detection.box if len(encoded) > 1 else None
-    active_events.mark_event(encoded[-1].detection.box, clock_fn(), previous_box)
+    active_events.mark_event(confirmed_box, clock_fn(), previous_box)
 
-    encoded.sort(key=lambda item: core.image_sharpness(item.detection.crop), reverse=True)
-    selected = encoded[: settings.sharpest_frames]
-    preferred_names = core.preferred_regional_species_names(settings.region_profile, event_time.month)
-    preferred = core.preferred_regional_species(settings.region_profile, event_time.month)
-    broad = core.regional_species(settings.region_profile, event_time.month)
-    plausible = core.identification_plausible_species(settings.region_profile, event_time.month)
+    try:
+        encoded.sort(key=lambda item: image_sharpness(item.detection.crop), reverse=True)
+        selected = encoded[: settings.sharpest_frames]
+        preferred_names = preferred_regional_species_names(settings.region_profile, event_time.month)
+        preferred = preferred_regional_species(settings.region_profile, event_time.month)
+        broad = regional_species(settings.region_profile, event_time.month)
+        plausible = identification_plausible_species(settings.region_profile, event_time.month)
 
-    frame_predictions = [
-        hybrid_predictions(models, item.detection.crop, item.embedding, preferred_names, preferred, broad, settings)
-        for item in selected
-    ]
-    identification = core.resolve_identification(
-        frame_predictions,
-        settings.consensus_min_votes,
-        settings.species_min_confidence,
-        settings.species_min_margin,
-        plausible,
-    )
+        frame_predictions = [
+            hybrid_predictions(
+                models,
+                item.detection.crop,
+                item.embedding,
+                preferred_names,
+                preferred,
+                broad,
+                settings,
+            )
+            for item in selected
+        ]
+        identification = resolve_identification(
+            frame_predictions,
+            settings.consensus_min_votes,
+            settings.species_min_confidence,
+            settings.species_min_margin,
+            plausible,
+        )
 
-    image_path = core.save_bird_image(selected[0].detection.crop, settings.image_dir, identification.candidate_name, event_time)
-    LOG.info(
-        "Bird identification: %s; votes %d/%d, confidence %.1f%%, margin %.1f%%",
-        identification.display_name,
-        identification.votes,
-        identification.frame_count,
-        identification.confidence * 100,
-        identification.margin * 100,
-    )
-    if retry_queue is None:
-        try:
-            core.send_email(settings.email, identification, event_time, image_path)
-        except Exception:
-            LOG.exception("Email failed; image remains saved")
-        else:
+        image_path = save_bird_image(
+            selected[0].detection.crop,
+            settings.image_dir,
+            identification.candidate_name,
+            event_time,
+        )
+        LOG.info(
+            "Bird identification: %s; votes %d/%d, confidence %.1f%%, margin %.1f%%",
+            identification.display_name,
+            identification.votes,
+            identification.frame_count,
+            identification.confidence * 100,
+            identification.margin * 100,
+        )
+        if retry_queue is None:
+            try:
+                send_email(settings.email, identification, event_time, image_path)
+            except Exception:
+                LOG.exception("Email failed; image remains saved")
+            else:
+                LOG.info("Email alert sent for %s", identification.display_name)
+        elif send_or_queue(retry_queue, settings.email, identification, event_time, image_path):
             LOG.info("Email alert sent for %s", identification.display_name)
-    elif send_or_queue(retry_queue, settings.email, identification, event_time, image_path):
-        LOG.info("Email alert sent for %s", identification.display_name)
-    return True
+        return True
+    finally:
+        # Classification and SMTP can take longer than EVENT_CLEAR_SECONDS on CPU.
+        # Refresh from completion time so a continuously present bird is not treated
+        # as a new event immediately after the expensive processing path returns.
+        active_events.mark_event(confirmed_box, clock_fn(), previous_box)
 
 
 def run(runtime_config: RuntimeConfig) -> None:
     settings = runtime_config.settings
     settings.image_dir.mkdir(parents=True, exist_ok=True)
-    models = core.BirdModels(
+    models = BirdModels(
         settings.detector_model,
         settings.detector_sha256,
         settings.classifier_model,
@@ -106,7 +145,12 @@ def run(runtime_config: RuntimeConfig) -> None:
         while True:
             retry_queue.retry_due(settings.email)
             if capture is None:
-                capture = core.open_camera(settings.camera, settings.camera_width, settings.camera_height, settings.camera_fps)
+                capture = open_camera(
+                    settings.camera,
+                    settings.camera_width,
+                    settings.camera_height,
+                    settings.camera_fps,
+                )
                 if capture is None:
                     LOG.error("Could not open camera %r; retrying in 5 seconds", settings.camera)
                     time.sleep(5)
