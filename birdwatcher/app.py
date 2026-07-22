@@ -8,28 +8,15 @@ from typing import Callable
 
 import legacy_main as core
 
+from .alerts import EmailRetryQueue, send_or_queue
 from .classification import encode_accepted_crops, hybrid_predictions
 from .config import RuntimeConfig, load_runtime_config
-from .tracking import (
-    ActiveEventTracker,
-    choose_initial_detection,
-    collect_tracked_crops,
-    detect_birds,
-)
+from .tracking import ActiveEventTracker, choose_initial_detection, collect_tracked_crops, detect_birds
 
 LOG = logging.getLogger("bird_watcher")
 
 
-def process_new_event(
-    capture,
-    models,
-    initial,
-    settings,
-    active_events: ActiveEventTracker,
-    event_time: datetime,
-    *,
-    clock_fn: Callable[[], float] = time.monotonic,
-) -> bool:
+def process_new_event(capture, models, initial, settings, active_events: ActiveEventTracker, event_time: datetime, *, retry_queue: EmailRetryQueue | None = None, clock_fn: Callable[[], float] = time.monotonic) -> bool:
     """Validate, classify, save, and alert once for one newly observed bird event."""
     tracked = collect_tracked_crops(capture, models, initial, settings)
     valid, reason = core.validate_bird_event(
@@ -44,54 +31,23 @@ def process_new_event(
 
     valid_ids = {id(crop) for crop, _ in valid}
     valid_tracked = [item for item in tracked if id(item.crop) in valid_ids]
-    encoded = encode_accepted_crops(
-        valid_tracked,
-        models,
-        settings.min_bird_presence_score,
-    )
+    encoded = encode_accepted_crops(valid_tracked, models, settings.min_bird_presence_score)
     if len(encoded) < settings.min_bird_presence_frames:
-        LOG.info(
-            "Suppressed bird event: only %d crop(s) passed BioCLIP presence gate",
-            len(encoded),
-        )
+        LOG.info("Suppressed bird event: only %d crop(s) passed BioCLIP presence gate", len(encoded))
         return False
 
-    # The event is now confirmed as a real bird. Timestamp it after the burst and
-    # presence gate, not at the first scan, so a long inference cycle cannot make
-    # the event look expired immediately on the next camera frame.
     previous_box = encoded[-2].detection.box if len(encoded) > 1 else None
-    active_events.mark_event(
-        encoded[-1].detection.box,
-        clock_fn(),
-        previous_box,
-    )
+    active_events.mark_event(encoded[-1].detection.box, clock_fn(), previous_box)
 
-    encoded.sort(
-        key=lambda item: core.image_sharpness(item.detection.crop),
-        reverse=True,
-    )
+    encoded.sort(key=lambda item: core.image_sharpness(item.detection.crop), reverse=True)
     selected = encoded[: settings.sharpest_frames]
-    preferred_names = core.preferred_regional_species_names(
-        settings.region_profile, event_time.month
-    )
-    preferred = core.preferred_regional_species(
-        settings.region_profile, event_time.month
-    )
+    preferred_names = core.preferred_regional_species_names(settings.region_profile, event_time.month)
+    preferred = core.preferred_regional_species(settings.region_profile, event_time.month)
     broad = core.regional_species(settings.region_profile, event_time.month)
-    plausible = core.identification_plausible_species(
-        settings.region_profile, event_time.month
-    )
+    plausible = core.identification_plausible_species(settings.region_profile, event_time.month)
 
     frame_predictions = [
-        hybrid_predictions(
-            models,
-            item.detection.crop,
-            item.embedding,
-            preferred_names,
-            preferred,
-            broad,
-            settings,
-        )
+        hybrid_predictions(models, item.detection.crop, item.embedding, preferred_names, preferred, broad, settings)
         for item in selected
     ]
     identification = core.resolve_identification(
@@ -102,12 +58,7 @@ def process_new_event(
         plausible,
     )
 
-    image_path = core.save_bird_image(
-        selected[0].detection.crop,
-        settings.image_dir,
-        identification.candidate_name,
-        event_time,
-    )
+    image_path = core.save_bird_image(selected[0].detection.crop, settings.image_dir, identification.candidate_name, event_time)
     LOG.info(
         "Bird identification: %s; votes %d/%d, confidence %.1f%%, margin %.1f%%",
         identification.display_name,
@@ -116,13 +67,14 @@ def process_new_event(
         identification.confidence * 100,
         identification.margin * 100,
     )
-    try:
-        core.send_email(settings.email, identification, event_time, image_path)
-    except Exception:
-        LOG.exception(
-            "Email failed; image remains saved and the active event stays suppressed"
-        )
-    else:
+    if retry_queue is None:
+        try:
+            core.send_email(settings.email, identification, event_time, image_path)
+        except Exception:
+            LOG.exception("Email failed; image remains saved")
+        else:
+            LOG.info("Email alert sent for %s", identification.display_name)
+    elif send_or_queue(retry_queue, settings.email, identification, event_time, image_path):
         LOG.info("Email alert sent for %s", identification.display_name)
     return True
 
@@ -142,6 +94,7 @@ def run(runtime_config: RuntimeConfig) -> None:
         clear_seconds=runtime_config.event_clear_seconds,
         max_age_seconds=runtime_config.active_event_max_age.total_seconds(),
     )
+    retry_queue = EmailRetryQueue(settings.image_dir / ".email_retry_queue")
     capture = None
     LOG.info(
         "Watching camera %r; active events clear after %.1fs of absence",
@@ -151,18 +104,11 @@ def run(runtime_config: RuntimeConfig) -> None:
 
     try:
         while True:
+            retry_queue.retry_due(settings.email)
             if capture is None:
-                capture = core.open_camera(
-                    settings.camera,
-                    settings.camera_width,
-                    settings.camera_height,
-                    settings.camera_fps,
-                )
+                capture = core.open_camera(settings.camera, settings.camera_width, settings.camera_height, settings.camera_fps)
                 if capture is None:
-                    LOG.error(
-                        "Could not open camera %r; retrying in 5 seconds",
-                        settings.camera,
-                    )
+                    LOG.error("Could not open camera %r; retrying in 5 seconds", settings.camera)
                     time.sleep(5)
                     continue
 
@@ -182,17 +128,10 @@ def run(runtime_config: RuntimeConfig) -> None:
                     time.sleep(max(0.0, settings.scan_interval))
                     continue
 
-                # Existing birds are touched and removed from consideration here,
-                # before the expensive burst and classification work. A different
-                # spatially distinct bird can still start a new event immediately.
-                new_detections = active_events.partition_new_detections(
-                    detections, scan_clock
-                )
+                new_detections = active_events.partition_new_detections(detections, scan_clock)
                 initial = choose_initial_detection(new_detections)
                 if initial is None:
-                    LOG.debug(
-                        "Only active bird event(s) detected; skipping extended classification"
-                    )
+                    LOG.debug("Only active bird event(s) detected; skipping extended classification")
                     time.sleep(max(0.0, settings.scan_interval))
                     continue
 
@@ -203,6 +142,7 @@ def run(runtime_config: RuntimeConfig) -> None:
                     settings,
                     active_events,
                     datetime.now().astimezone(),
+                    retry_queue=retry_queue,
                 )
             except Exception:
                 LOG.exception("Detection failed; continuing")
@@ -216,10 +156,7 @@ def run(runtime_config: RuntimeConfig) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         run(load_runtime_config())
     except Exception:
