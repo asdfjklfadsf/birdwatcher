@@ -1,3 +1,16 @@
 """Bird Watcher application package."""
 
-__all__ = ["app", "classification", "config", "tracking"]
+__all__ = [
+    "alerts",
+    "app",
+    "classification",
+    "config",
+    "domain",
+    "emailer",
+    "media",
+    "models",
+    "region",
+    "settings",
+    "tracking",
+    "validation",
+]
