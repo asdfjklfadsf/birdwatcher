@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
+from typing import Callable
 
 import legacy_main as core
 
@@ -26,7 +27,8 @@ def process_new_event(
     settings,
     active_events: ActiveEventTracker,
     event_time: datetime,
-    event_clock: float,
+    *,
+    clock_fn: Callable[[], float] = time.monotonic,
 ) -> bool:
     """Validate, classify, save, and alert once for one newly observed bird event."""
     tracked = collect_tracked_crops(capture, models, initial, settings)
@@ -54,11 +56,15 @@ def process_new_event(
         )
         return False
 
-    # The event is now confirmed as a real bird. Mark the spatial event before
-    # species inference or SMTP so a prediction change or delivery failure cannot
-    # cause repeated expensive processing while the same bird remains in view.
+    # The event is now confirmed as a real bird. Timestamp it after the burst and
+    # presence gate, not at the first scan, so a long inference cycle cannot make
+    # the event look expired immediately on the next camera frame.
     previous_box = encoded[-2].detection.box if len(encoded) > 1 else None
-    active_events.mark_event(encoded[-1].detection.box, event_clock, previous_box)
+    active_events.mark_event(
+        encoded[-1].detection.box,
+        clock_fn(),
+        previous_box,
+    )
 
     encoded.sort(
         key=lambda item: core.image_sharpness(item.detection.crop),
@@ -197,7 +203,6 @@ def run(runtime_config: RuntimeConfig) -> None:
                     settings,
                     active_events,
                     datetime.now().astimezone(),
-                    scan_clock,
                 )
             except Exception:
                 LOG.exception("Detection failed; continuing")
