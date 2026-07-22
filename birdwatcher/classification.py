@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import cv2
 
-import legacy_main as core
+from .region import apply_regional_prior, combine_classifier_predictions
 from .tracking import TrackedDetection
 
 
@@ -44,9 +44,7 @@ def _species_text_features(models, names: tuple[str, ...]):
     )
     prompts = [template.format(name) for name in names for template in templates]
     with models.torch.inference_mode():
-        features = models.local_classifier.encode_text(
-            models.local_tokenizer(prompts).to(models.device)
-        )
+        features = models.local_classifier.encode_text(models.local_tokenizer(prompts).to(models.device))
         features = features / features.norm(dim=-1, keepdim=True)
         features = features.reshape(len(names), len(templates), -1).mean(dim=1)
         features = features / features.norm(dim=-1, keepdim=True)
@@ -73,9 +71,7 @@ def bird_presence_from_embedding(models, embedding) -> float:
         )
         prompts = [prompt for group in groups for prompt in group]
         with models.torch.inference_mode():
-            features = models.local_classifier.encode_text(
-                models.local_tokenizer(prompts).to(models.device)
-            )
+            features = models.local_classifier.encode_text(models.local_tokenizer(prompts).to(models.device))
             features = features / features.norm(dim=-1, keepdim=True)
             features = features.reshape(2, len(groups[0]), -1).mean(dim=1)
             features = features / features.norm(dim=-1, keepdim=True)
@@ -103,7 +99,6 @@ def local_predictions_from_embedding(models, embedding, species_names: set[str])
 def candidate_species_names(
     preferred_names: set[str], raw_global_predictions: list[tuple[str, float]]
 ) -> set[str]:
-    """Let the broad model propose unusual candidates for BioCLIP to evaluate."""
     return set(preferred_names) | {name for name, _ in raw_global_predictions}
 
 
@@ -117,7 +112,7 @@ def hybrid_predictions(
     settings,
 ):
     raw_global = models.identify_species_candidates(bird_image, top_k=20)
-    global_predictions = core.apply_regional_prior(
+    global_predictions = apply_regional_prior(
         raw_global,
         preferred_keys,
         settings.regional_prior_weight,
@@ -129,7 +124,7 @@ def hybrid_predictions(
         embedding,
         candidate_species_names(preferred_names, raw_global),
     )
-    return core.combine_classifier_predictions(
+    return combine_classifier_predictions(
         local_predictions,
         global_predictions,
         settings.local_classifier_weight,
@@ -144,7 +139,6 @@ def encode_accepted_crops(
     encoder: Callable | None = None,
     presence_scorer: Callable | None = None,
 ) -> list[EncodedCrop]:
-    """Encode each crop exactly once and reuse that embedding for presence scoring."""
     encoder = encoder or (lambda image: encode_bioclip_image(models, image))
     presence_scorer = presence_scorer or (
         lambda embedding: bird_presence_from_embedding(models, embedding)
