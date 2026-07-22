@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-
 Box = tuple[int, int, int, int]
 
 
@@ -48,16 +47,12 @@ def center_distance_ratio(a: Box, b: Box) -> float:
     distance = math.hypot(acx - bcx, acy - bcy)
     scale = max(
         1.0,
-        math.hypot(
-            max(ax2 - ax1, bx2 - bx1),
-            max(ay2 - ay1, by2 - by1),
-        ),
+        math.hypot(max(ax2 - ax1, bx2 - bx1), max(ay2 - ay1, by2 - by1)),
     )
     return distance / scale
 
 
 def predict_box(previous_box: Box | None, current_box: Box) -> Box:
-    """Project one step using the last observed center displacement."""
     if previous_box is None:
         return current_box
     px1, py1, px2, py2 = previous_box
@@ -74,7 +69,6 @@ def predict_box(previous_box: Box | None, current_box: Box) -> Box:
 
 
 def box_match_score(current_box: Box, candidate_box: Box, previous_box: Box | None = None) -> float | None:
-    """Score a likely continuation using overlap, motion prediction, and center distance."""
     predicted = predict_box(previous_box, current_box)
     current_iou = box_iou(current_box, candidate_box)
     predicted_iou = box_iou(predicted, candidate_box)
@@ -99,10 +93,7 @@ def pad_crop(frame, box: Box, crop_padding: float):
     x1, y1, x2, y2 = box
     height, width = frame.shape[:2]
     box_dim = max(x2 - x1, y2 - y1)
-    relative_padding = min(
-        1.0,
-        crop_padding + 0.6 * (1.0 - min(1.0, box_dim / 220.0)),
-    )
+    relative_padding = min(1.0, crop_padding + 0.6 * (1.0 - min(1.0, box_dim / 220.0)))
     padding = int(relative_padding * box_dim)
     px1, py1 = max(0, x1 - padding), max(0, y1 - padding)
     px2, py2 = min(width, x2 + padding), min(height, y2 + padding)
@@ -113,7 +104,6 @@ def pad_crop(frame, box: Box, crop_padding: float):
 
 
 def detect_birds(models, frame, settings) -> list[TrackedDetection]:
-    """Return all plausible bird detections in full-frame coordinates."""
     height, width = frame.shape[:2]
     raw: list[tuple[int, int, int, int, float]] = []
 
@@ -192,7 +182,6 @@ def collect_tracked_crops(
     sleep_fn: Callable[[float], None] = time.sleep,
     clock_fn: Callable[[], float] = time.monotonic,
 ) -> list[TrackedDetection]:
-    """Collect temporally spaced detections while following one spatial track."""
     detections = [initial_detection]
     previous_box: Box | None = None
     current_box = initial_detection.box
@@ -252,17 +241,33 @@ class ActiveEventTracker:
     def partition_new_detections(
         self, detections: list[TrackedDetection], now: float
     ) -> list[TrackedDetection]:
-        """Touch matching active events and return detections that represent new events."""
+        """Match active events one-to-one and return detections that are new events."""
         self._prune(now)
-        new_detections: list[TrackedDetection] = []
-        for detection in sorted(detections, key=detection_quality, reverse=True):
-            event = self._find_event(detection.box)
-            if event is None:
-                new_detections.append(detection)
+        ranked = sorted(detections, key=detection_quality, reverse=True)
+        candidates: list[tuple[float, float, float, int, int]] = []
+        for event_index, event in enumerate(self._events):
+            for detection_index, detection in enumerate(ranked):
+                score = box_match_score(event.box, detection.box, event.previous_box)
+                if score is not None:
+                    candidates.append(
+                        (score, detection.score, detection_quality(detection), event_index, detection_index)
+                    )
+
+        used_events: set[int] = set()
+        used_detections: set[int] = set()
+        for _score, _confidence, _quality, event_index, detection_index in sorted(
+            candidates, reverse=True
+        ):
+            if event_index in used_events or detection_index in used_detections:
                 continue
+            event = self._events[event_index]
+            detection = ranked[detection_index]
             event.previous_box, event.box = event.box, detection.box
             event.last_seen_at = now
-        return new_detections
+            used_events.add(event_index)
+            used_detections.add(detection_index)
+
+        return [detection for index, detection in enumerate(ranked) if index not in used_detections]
 
     def mark_event(self, box: Box, now: float, previous_box: Box | None = None) -> None:
         self._prune(now)
