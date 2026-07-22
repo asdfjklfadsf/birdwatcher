@@ -177,7 +177,9 @@ def match_tracked_detection(
         score = box_match_score(current_box, detection.box, previous_box)
         if score is not None:
             candidates.append((score, detection.score, detection))
-    return max(candidates, default=(0.0, 0.0, None), key=lambda item: (item[0], item[1]))[2]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def collect_tracked_crops(
@@ -243,7 +245,9 @@ class ActiveEventTracker:
             score = box_match_score(event.box, box, event.previous_box)
             if score is not None:
                 matches.append((score, event))
-        return max(matches, default=(0.0, None), key=lambda item: item[0])[1]
+        if not matches:
+            return None
+        return max(matches, key=lambda item: item[0])[1]
 
     def partition_new_detections(
         self, detections: list[TrackedDetection], now: float
