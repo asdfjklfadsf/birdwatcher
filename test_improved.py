@@ -3,9 +3,9 @@ import sys
 import types
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
-# Keep logic tests lightweight; ML packages are loaded only when real models start.
 for name in ("cv2", "torch", "transformers", "ultralytics"):
     sys.modules.setdefault(name, types.ModuleType(name))
 
@@ -52,6 +52,15 @@ class TrackingAndEventTests(unittest.TestCase):
         different = TrackedDetection("different", 0.8, (500, 100, 580, 180))
         new = tracker.partition_new_detections([same, different], now=1.0)
         self.assertEqual(new, [different])
+        self.assertEqual(tracker.active_count, 1)
+
+    def test_active_event_matching_is_one_to_one(self):
+        tracker = ActiveEventTracker(clear_seconds=3.0, max_age_seconds=600.0)
+        tracker.mark_event((100, 100, 180, 180), now=0.0)
+        best_match = TrackedDetection("existing", 0.95, (102, 100, 182, 180))
+        nearby_second_bird = TrackedDetection("new", 0.90, (145, 100, 225, 180))
+        new = tracker.partition_new_detections([best_match, nearby_second_bird], now=1.0)
+        self.assertEqual(new, [nearby_second_bird])
         self.assertEqual(tracker.active_count, 1)
 
     def test_active_event_closes_after_absence(self):
@@ -153,7 +162,14 @@ class ConfigurationAndEntrypointTests(unittest.TestCase):
         from birdwatcher import app
 
         self.assertIs(main.main, app.main)
-        self.assertEqual(main.__name__, "main")
+
+    def test_production_package_has_no_legacy_main_imports(self):
+        package = Path(__file__).parent / "birdwatcher"
+        offenders = []
+        for path in package.glob("*.py"):
+            if "legacy_main" in path.read_text(encoding="utf-8"):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
