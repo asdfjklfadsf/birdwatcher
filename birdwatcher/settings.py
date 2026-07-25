@@ -6,6 +6,7 @@ import os
 import re
 from datetime import timedelta
 
+from .constants import BROAD_REGIONAL_PRIOR_WEIGHT
 from .domain import AppSettings
 from .region import regional_species
 
@@ -63,8 +64,14 @@ def validate_settings(settings: AppSettings) -> None:
         raise ValueError("SPECIES_MIN_CONFIDENCE must be between 0 and 1")
     if not 0 <= settings.species_min_margin <= 1:
         raise ValueError("SPECIES_MIN_MARGIN must be between 0 and 1")
-    if not math.isfinite(settings.regional_prior_weight) or settings.regional_prior_weight < 1:
-        raise ValueError("REGIONAL_PRIOR_WEIGHT must be finite and at least 1")
+    if (
+        not math.isfinite(settings.regional_prior_weight)
+        or settings.regional_prior_weight < BROAD_REGIONAL_PRIOR_WEIGHT
+    ):
+        raise ValueError(
+            "REGIONAL_PRIOR_WEIGHT must be finite and at least "
+            f"{BROAD_REGIONAL_PRIOR_WEIGHT:g}"
+        )
     regional_species(settings.region_profile, 7)
     if settings.email.use_ssl and settings.email.use_starttls:
         raise ValueError("Enable only one of SMTP_USE_SSL and SMTP_USE_STARTTLS")
