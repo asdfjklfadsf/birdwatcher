@@ -182,7 +182,7 @@ def run(runtime_config: RuntimeConfig) -> None:
                 # instead of on every idle frame. Tracked bursts share this
                 # budget rather than getting an unthrottled one of their own.
                 detections = detect_birds(
-                    models, frame, settings, allow_tile_sweep=tile_sweep.allow(scan_clock)
+                    models, frame, settings, tile_sweep=tile_sweep, now=scan_clock
                 )
                 if not detections:
                     active_events.observe_no_detection(scan_clock)

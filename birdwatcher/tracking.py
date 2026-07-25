@@ -123,12 +123,25 @@ def deduplicate_boxes(
     return kept
 
 
-def detect_birds(models, frame, settings, *, allow_tile_sweep: bool = True) -> list[TrackedDetection]:
+def detect_birds(
+    models,
+    frame,
+    settings,
+    *,
+    allow_tile_sweep: bool = True,
+    tile_sweep: TileSweepThrottle | None = None,
+    now: float | None = None,
+) -> list[TrackedDetection]:
     """Detect birds, falling back to a low-confidence sweep when none are found.
 
-    ``allow_tile_sweep`` gates only the nine-tile pass, which costs nine extra
-    inferences. The caller throttles it so an idle camera does not pay for it on
-    every scan; the cheaper full-frame passes always run.
+    Both knobs gate only the nine-tile pass, which costs nine extra inferences;
+    the cheaper full-frame passes always run. ``allow_tile_sweep`` is a hard off
+    switch, while ``tile_sweep`` is a rate limiter shared across the pipeline.
+
+    The limiter is consulted here rather than by the caller because only this
+    function knows whether a sweep is actually about to happen. Deciding up
+    front would spend the budget on frames where the cheaper passes already
+    found the bird, leaving none for the frames that lost it.
     """
     height, width = frame.shape[:2]
     raw: list[tuple[int, int, int, int, float]] = []
@@ -152,7 +165,11 @@ def detect_birds(models, frame, settings, *, allow_tile_sweep: bool = True) -> l
         ):
             accept(x1, y1, x2, y2, score)
 
-    if not raw and allow_tile_sweep:
+    if (
+        not raw
+        and allow_tile_sweep
+        and (tile_sweep is None or tile_sweep.allow(time.monotonic() if now is None else now))
+    ):
         for ty in range(3):
             for tx in range(3):
                 y0, y1t = int(ty * height / 3), int((ty + 1) * height / 3)
@@ -246,10 +263,9 @@ def collect_tracked_crops(
             continue
         # A nine-frame burst would otherwise be able to run the tile sweep eight
         # times, stretching the sampling schedule well past its wall-clock plan.
-        allow_tile_sweep = tile_sweep is None or tile_sweep.allow(clock_fn())
         matched = match_tracked_detection(
             current_box,
-            detect_fn(models, frame, settings, allow_tile_sweep=allow_tile_sweep),
+            detect_fn(models, frame, settings, tile_sweep=tile_sweep, now=clock_fn()),
             previous_box,
         )
         if matched is None:

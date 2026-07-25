@@ -61,6 +61,7 @@ The normal pass runs one detector inference per scan. When it finds nothing, a f
 
 - The nine-tile sweep costs nine extra inferences, so it is rate-limited by `TILE_SWEEP_INTERVAL_SECONDS`.
 - Top-level scans and tracked observation bursts draw from one shared budget. This matters most during a burst: samples are taken on a wall-clock schedule, so sweeps that overrun `BURST_FRAME_INTERVAL_SECONDS` stretch the observation window rather than merely costing CPU.
+- The interval is spent only when a sweep actually runs. Frames where the cheaper passes already found the bird cost nothing, so the budget stays available for the frames that lost it.
 - Overlapping boxes from the different passes are collapsed by non-maximum suppression, so one bird cannot become several detections.
 
 ## Species naming

@@ -142,20 +142,50 @@ class TileSweepThrottleTests(unittest.TestCase):
         throttle = TileSweepThrottle(0.0)
         self.assertTrue(all(throttle.allow(float(tick)) for tick in range(5)))
 
+    def test_throttle_is_not_spent_when_the_primary_pass_finds_a_bird(self):
+        """Budget must survive frames that never needed a sweep."""
+        throttle = TileSweepThrottle(5.0)
+
+        found = _SweepModels({640: [(100, 100, 180, 180, 0.80)]})
+        detect_birds(found, _Frame(), _settings(), tile_sweep=throttle, now=100.0)
+        self.assertEqual(found.calls, [640])
+
+        # One second later the bird is lost. The sweep must still be affordable.
+        lost = _SweepModels()
+        detect_birds(lost, _Frame(), _settings(), tile_sweep=throttle, now=101.0)
+        self.assertEqual(lost.calls, [640, 1280] + [640] * 9)
+
+    def test_throttle_is_spent_only_by_frames_that_actually_sweep(self):
+        throttle = TileSweepThrottle(5.0)
+
+        first = _SweepModels()
+        detect_birds(first, _Frame(), _settings(), tile_sweep=throttle, now=100.0)
+        self.assertEqual(len(first.calls), 11)
+
+        within_interval = _SweepModels()
+        detect_birds(within_interval, _Frame(), _settings(), tile_sweep=throttle, now=102.0)
+        self.assertEqual(within_interval.calls, [640, 1280])
+
+        after_interval = _SweepModels()
+        detect_birds(after_interval, _Frame(), _settings(), tile_sweep=throttle, now=105.0)
+        self.assertEqual(len(after_interval.calls), 11)
+
     def test_tracked_burst_shares_the_throttle_instead_of_sweeping_every_frame(self):
         """A nine-frame burst used to allow eight unthrottled tile sweeps."""
         from birdwatcher.tracking import collect_tracked_crops
 
-        requested = []
-        ticks = iter([float(t) for t in range(0, 60)])
+        swept = []
+        now = [0.0]
         throttle = TileSweepThrottle(5.0)
 
         class Capture:
             def read(self):
                 return True, "frame"
 
-        def fake_detect(_models, _frame, _settings, *, allow_tile_sweep=True):
-            requested.append(allow_tile_sweep)
+        def fake_detect(_models, _frame, _burst_settings, *, tile_sweep=None, now=None):
+            models = _SweepModels()
+            detect_birds(models, _Frame(), _settings(), tile_sweep=tile_sweep, now=now)
+            swept.append(len(models.calls) == 11)
             return []
 
         collect_tracked_crops(
@@ -164,25 +194,25 @@ class TileSweepThrottleTests(unittest.TestCase):
             TrackedDetection("crop", 0.8, (0, 0, 10, 10)),
             types.SimpleNamespace(burst_frames=9, burst_frame_interval=1.0),
             detect_fn=fake_detect,
-            sleep_fn=lambda _seconds: None,
-            clock_fn=lambda: next(ticks),
+            sleep_fn=lambda seconds: now.__setitem__(0, now[0] + max(0.0, seconds)),
+            clock_fn=lambda: now[0],
             tile_sweep=throttle,
         )
 
-        self.assertEqual(len(requested), 8)
-        self.assertLessEqual(sum(requested), 3)
+        self.assertEqual(len(swept), 8)
+        self.assertLessEqual(sum(swept), 3)
 
     def test_burst_sweeps_freely_when_no_throttle_is_supplied(self):
         from birdwatcher.tracking import collect_tracked_crops
 
-        requested = []
+        received = []
 
         class Capture:
             def read(self):
                 return True, "frame"
 
-        def fake_detect(_models, _frame, _settings, *, allow_tile_sweep=True):
-            requested.append(allow_tile_sweep)
+        def fake_detect(_models, _frame, _settings, *, tile_sweep=None, now=None):
+            received.append(tile_sweep)
             return []
 
         collect_tracked_crops(
@@ -195,7 +225,7 @@ class TileSweepThrottleTests(unittest.TestCase):
             clock_fn=lambda: 0.0,
         )
 
-        self.assertEqual(requested, [True, True, True])
+        self.assertEqual(received, [None, None, None])
 
     def test_run_loop_rate_limits_the_tile_sweep(self):
         from datetime import timedelta
@@ -242,8 +272,10 @@ class TileSweepThrottleTests(unittest.TestCase):
                 active_event_max_age=timedelta(minutes=10),
             )
 
-            def fake_detect(_models, _frame, _settings, *, allow_tile_sweep=True):
-                requested.append(allow_tile_sweep)
+            def fake_detect(_models, _frame, _scan_settings, *, tile_sweep=None, now=None):
+                models = _SweepModels()
+                detect_birds(models, _Frame(), _settings(), tile_sweep=tile_sweep, now=now)
+                requested.append(len(models.calls) == 11)
                 return []
 
             with (
