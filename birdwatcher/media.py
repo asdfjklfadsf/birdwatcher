@@ -47,6 +47,12 @@ def open_camera(camera: int | str, width: int, height: int, fps: float):
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_FPS, fps)
+    # Scanning is slower than the capture rate, so a queued buffer would hand us
+    # frames from seconds ago. Ask for the newest frame instead; not every
+    # backend honors this, so it is best-effort.
+    buffer_size = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+    if buffer_size is not None:
+        capture.set(buffer_size, 1)
     if not capture.isOpened():
         capture.release()
         return None

@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
+from .constants import DUPLICATE_DETECTION_IOU
+
 Box = tuple[int, int, int, int]
 
 
@@ -103,7 +105,31 @@ def pad_crop(frame, box: Box, crop_padding: float):
     return crop
 
 
-def detect_birds(models, frame, settings) -> list[TrackedDetection]:
+def deduplicate_boxes(
+    boxes: list[tuple[int, int, int, int, float]],
+    iou_threshold: float = DUPLICATE_DETECTION_IOU,
+) -> list[tuple[int, int, int, int, float]]:
+    """Greedy non-maximum suppression over scored boxes, highest score first.
+
+    The full-frame and tiled sweeps overlap, so one bird can be reported several
+    times. Without this, each copy becomes its own detection and event.
+    """
+    kept: list[tuple[int, int, int, int, float]] = []
+    for candidate in sorted(boxes, key=lambda item: -item[4]):
+        box = candidate[:4]
+        if any(box_iou(box, keep[:4]) > iou_threshold for keep in kept):
+            continue
+        kept.append(candidate)
+    return kept
+
+
+def detect_birds(models, frame, settings, *, allow_tile_sweep: bool = True) -> list[TrackedDetection]:
+    """Detect birds, falling back to a low-confidence sweep when none are found.
+
+    ``allow_tile_sweep`` gates only the nine-tile pass, which costs nine extra
+    inferences. The caller throttles it so an idle camera does not pay for it on
+    every scan; the cheaper full-frame passes always run.
+    """
     height, width = frame.shape[:2]
     raw: list[tuple[int, int, int, int, float]] = []
 
@@ -115,16 +141,18 @@ def detect_birds(models, frame, settings) -> list[TrackedDetection]:
         if ratio <= settings.max_bird_crop_aspect_ratio:
             raw.append((x1, y1, x2, y2, score))
 
-    for x1, y1, x2, y2, score in models._collect_bird_boxes(
+    for x1, y1, x2, y2, score in models.collect_bird_boxes(
         frame, 640, settings.detection_confidence
     ):
         accept(x1, y1, x2, y2, score)
 
     if not raw:
-        for x1, y1, x2, y2, score in models._collect_bird_boxes(
+        for x1, y1, x2, y2, score in models.collect_bird_boxes(
             frame, 1280, settings.detection_floor_confidence
         ):
             accept(x1, y1, x2, y2, score)
+
+    if not raw and allow_tile_sweep:
         for ty in range(3):
             for tx in range(3):
                 y0, y1t = int(ty * height / 3), int((ty + 1) * height / 3)
@@ -132,7 +160,7 @@ def detect_birds(models, frame, settings) -> list[TrackedDetection]:
                 tile = frame[y0:y1t, x0:x1t]
                 if tile.size == 0:
                     continue
-                for lx1, ly1, lx2, ly2, score in models._collect_bird_boxes(
+                for lx1, ly1, lx2, ly2, score in models.collect_bird_boxes(
                     tile, 640, settings.detection_floor_confidence
                 ):
                     accept(x0 + lx1, y0 + ly1, x0 + lx2, y0 + ly2, score)
@@ -143,7 +171,7 @@ def detect_birds(models, frame, settings) -> list[TrackedDetection]:
             score=score,
             box=(x1, y1, x2, y2),
         )
-        for x1, y1, x2, y2, score in raw
+        for x1, y1, x2, y2, score in deduplicate_boxes(raw)
     ]
 
 

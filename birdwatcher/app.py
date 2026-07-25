@@ -48,8 +48,11 @@ def process_new_event(
         LOG.info("Suppressed false bird event: %s", reason)
         return False
 
-    valid_ids = {id(crop) for crop, _ in valid}
-    valid_tracked = [item for item in tracked if id(item.crop) in valid_ids]
+    # validate_bird_event filters the (crop, score) pairs without copying the
+    # crops, so the accepted crop objects are the very ones held by `tracked`.
+    # Identity is what maps them back; equality would be wrong for image arrays.
+    valid_crops = {id(crop) for crop, _ in valid}
+    valid_tracked = [item for item in tracked if id(item.crop) in valid_crops]
     encoded = encode_accepted_crops(valid_tracked, models, settings.min_bird_presence_score)
     if len(encoded) < settings.min_bird_presence_frames:
         LOG.info("Suppressed bird event: only %d crop(s) passed BioCLIP presence gate", len(encoded))
@@ -135,6 +138,7 @@ def run(runtime_config: RuntimeConfig) -> None:
     )
     retry_queue = EmailRetryQueue(settings.image_dir / ".email_retry_queue")
     capture = None
+    next_tile_sweep = 0.0
     LOG.info(
         "Watching camera %r; active events clear after %.1fs of absence",
         settings.camera,
@@ -166,7 +170,15 @@ def run(runtime_config: RuntimeConfig) -> None:
 
             try:
                 scan_clock = time.monotonic()
-                detections = detect_birds(models, frame, settings)
+                # The nine-tile sweep only helps for small/distant birds and
+                # costs nine extra inferences, so run it on a slower cadence
+                # instead of on every idle frame.
+                allow_tile_sweep = scan_clock >= next_tile_sweep
+                if allow_tile_sweep:
+                    next_tile_sweep = scan_clock + settings.tile_sweep_interval
+                detections = detect_birds(
+                    models, frame, settings, allow_tile_sweep=allow_tile_sweep
+                )
                 if not detections:
                     active_events.observe_no_detection(scan_clock)
                     time.sleep(max(0.0, settings.scan_interval))

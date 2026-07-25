@@ -1,17 +1,15 @@
 """BioCLIP and broad-classifier orchestration for Bird Watcher."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import cv2
 
-from .constants import BROAD_REGIONAL_PRIOR_WEIGHT
-from .region import (
-    apply_regional_prior,
-    combine_classifier_predictions as combine_raw_classifier_predictions,
-)
-from .species import canonical_species_name, collapse_species_aliases
+from .constants import BROAD_REGIONAL_PRIOR_WEIGHT, TEXT_FEATURE_CACHE_SIZE
+from .region import apply_regional_prior, combine_classifier_predictions
+from .species import canonical_species_name
 from .tracking import TrackedDetection
 
 
@@ -33,11 +31,14 @@ def encode_bioclip_image(models, bird_image):
 
 
 def _species_text_features(models, names: tuple[str, ...]):
+    # The candidate set includes the broad model's top-k, so it changes almost
+    # every frame. Bound the cache or a long-running watcher grows without limit.
     cache = getattr(models, "_runtime_text_cache", None)
     if cache is None:
-        cache = {}
+        cache = OrderedDict()
         models._runtime_text_cache = cache
     if names in cache:
+        cache.move_to_end(names)
         return cache[names]
 
     templates = (
@@ -54,6 +55,8 @@ def _species_text_features(models, names: tuple[str, ...]):
         features = features.reshape(len(names), len(templates), -1).mean(dim=1)
         features = features / features.norm(dim=-1, keepdim=True)
         cache[names] = features.T.contiguous()
+    while len(cache) > TEXT_FEATURE_CACHE_SIZE:
+        cache.popitem(last=False)
     return cache[names]
 
 
@@ -104,26 +107,9 @@ def local_predictions_from_embedding(models, embedding, species_names: set[str])
 def candidate_species_names(
     preferred_names: set[str], raw_global_predictions: list[tuple[str, float]]
 ) -> set[str]:
-    return {
-        canonical_species_name(name)
-        for name in preferred_names
-    } | {
-        canonical_species_name(name)
-        for name, _ in raw_global_predictions
+    return {canonical_species_name(name) for name in preferred_names} | {
+        canonical_species_name(name) for name, _ in raw_global_predictions
     }
-
-
-def combine_classifier_predictions(
-    local_predictions: list[tuple[str, float]],
-    global_predictions: list[tuple[str, float]],
-    local_weight: float,
-) -> list[tuple[str, float]]:
-    """Blend classifier scores after collapsing equivalent species labels."""
-    return combine_raw_classifier_predictions(
-        collapse_species_aliases(local_predictions),
-        collapse_species_aliases(global_predictions),
-        local_weight,
-    )
 
 
 def hybrid_predictions(
@@ -141,7 +127,9 @@ def hybrid_predictions(
         preferred_keys,
         settings.regional_prior_weight,
         plausible_species=broad_keys,
-        plausible_weight=BROAD_REGIONAL_PRIOR_WEIGHT,
+        # Never exceed the preferred weight: REGIONAL_PRIOR_WEIGHT=1.0 means
+        # "no regional preference at all", which must stay expressible.
+        plausible_weight=min(BROAD_REGIONAL_PRIOR_WEIGHT, settings.regional_prior_weight),
     )
     local_predictions = local_predictions_from_embedding(
         models,

@@ -66,6 +66,7 @@ def load_runtime_config() -> RuntimeConfig:
         cooldown=timedelta(minutes=max_event_minutes),
         scan_interval=float(os.getenv("SCAN_INTERVAL_SECONDS", "1")),
         detection_confidence=float(os.getenv("DETECTION_CONFIDENCE", "0.35")),
+        tile_sweep_interval=float(os.getenv("TILE_SWEEP_INTERVAL_SECONDS", "5")),
         crop_padding=float(os.getenv("DETECTION_CROP_PADDING", "0.20")),
         burst_frames=int(os.getenv("BURST_FRAMES", "9")),
         burst_frame_interval=float(os.getenv("BURST_FRAME_INTERVAL_SECONDS", "1.0")),
