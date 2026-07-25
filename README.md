@@ -25,6 +25,8 @@ main.py
      -> birdwatcher.validation   repeated-detection validation
      -> birdwatcher.classification  BioCLIP embedding reuse and hybrid scoring
      -> birdwatcher.region       regional priors and consensus resolution
+     -> birdwatcher.species      species aliases and canonical identity keys
+     -> birdwatcher.constants    shared tuning constants
      -> birdwatcher.media        camera and image helpers
      -> birdwatcher.emailer      SMTP delivery
      -> birdwatcher.alerts       persistent retry queue
@@ -52,6 +54,17 @@ Camera
 ```
 
 Tracking uses bounding-box overlap, center distance, and short motion prediction. Active-event matching is one-to-one within each scan, so a single existing event cannot consume multiple nearby detections.
+
+## Detection sweeps
+
+The normal pass runs one detector inference per scan. When it finds nothing, a full-frame low-confidence pass runs, and only then a nine-tile sweep for small or distant birds.
+
+- The nine-tile sweep costs nine extra inferences, so it is rate-limited by `TILE_SWEEP_INTERVAL_SECONDS` rather than running on every idle frame.
+- Overlapping boxes from the different passes are collapsed by non-maximum suppression, so one bird cannot become several detections.
+
+## Species naming
+
+The broad classifier spells some species differently from the regional checklists (for example `Tit Mouse` for `Tufted Titmouse`). `birdwatcher/species.py` holds the single alias table, and every comparison — regional priors, classifier blending, and the final plausibility gate — uses canonical identity keys. Without this, one bird's evidence splits across two labels and can lose to a runner-up.
 
 ## Active-event deduplication
 
@@ -154,7 +167,7 @@ Run the unit and integration suite with:
 python -m unittest -v
 ```
 
-The suite covers regional and consensus logic, event validation, motion-aware tracking, one-to-one active-event matching, event clearing and post-processing refresh, `.env` overrides, broad-candidate expansion, BioCLIP embedding reuse, retry persistence/backoff/quarantine, and the canonical modular entrypoint.
+The suite covers regional and consensus logic, event validation, motion-aware tracking, one-to-one active-event matching, event clearing and post-processing refresh, `.env` overrides, broad-candidate expansion, BioCLIP embedding reuse, retry persistence/backoff/quarantine, canonical species identity across every comparison stage, detection deduplication and tile-sweep rate limiting, the bounded prompt-embedding cache, and the canonical modular entrypoint.
 
 GitHub Actions has two jobs:
 
@@ -176,7 +189,9 @@ Real-camera validation is still recommended because CI does not download all mod
 | `ACTIVE_EVENT_MAX_MINUTES` | `10` | Maximum lifetime of one continuously active event |
 | `COOLDOWN_MINUTES` | `10` fallback | Backwards-compatible fallback when `ACTIVE_EVENT_MAX_MINUTES` is absent |
 | `DETECTION_CONFIDENCE` | `0.35` | Normal YOLO bird-detection threshold |
+| `TILE_SWEEP_INTERVAL_SECONDS` | `5` | Minimum delay between nine-tile low-confidence sweeps |
 | `DETECTION_CROP_PADDING` | `0.20` | Base crop context around the raw bird box |
+| `MAX_BIRD_CROP_ASPECT_RATIO` | `2.5` | Rejects implausibly elongated detection boxes |
 | `BURST_FRAMES` | `9` | Maximum observation samples in one tracked event |
 | `BURST_FRAME_INTERVAL_SECONDS` | `1.0` | Target spacing between observation samples |
 | `SHARPEST_FRAMES` | `7` | Maximum accepted crops used for identification |
@@ -189,7 +204,7 @@ Real-camera validation is still recommended because CI does not download all mod
 | `SPECIES_MIN_CONFIDENCE` | `0.60` | Minimum aggregate hybrid evidence score |
 | `SPECIES_MIN_MARGIN` | `0.20` | Minimum winner-versus-runner-up score margin |
 | `REGION_PROFILE` | `northern_nj` | Active regional profile |
-| `REGIONAL_PRIOR_WEIGHT` | `3.0` | Preferred local/seasonal regional multiplier |
+| `REGIONAL_PRIOR_WEIGHT` | `3.0` | Preferred local/seasonal regional multiplier; `1.0` disables the regional preference |
 | `LOCAL_CLASSIFIER_WEIGHT` | `0.65` | BioCLIP share of the hybrid species score |
 
 An event may pass the bird-presence gate with fewer frames than `CONSENSUS_MIN_VOTES`. In that case the app can report `Uncertain bird` because there is not enough multi-frame evidence for a definite species name.

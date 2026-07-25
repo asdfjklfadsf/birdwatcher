@@ -98,7 +98,8 @@ class BirdModels:
         self.local_classifier.eval().to(self.device)
         LOG.info("Models ready; species classifiers device: %s", self.device)
 
-    def _collect_bird_boxes(self, frame, imgsz: int, confidence: float):
+    def collect_bird_boxes(self, frame, imgsz: int, confidence: float):
+        """Return scored COCO-bird boxes for one frame or tile."""
         results = self.detector.predict(
             source=frame,
             classes=[14],
@@ -112,6 +113,9 @@ class BirdModels:
             score = float(box.conf[0])
             boxes.append((x1, y1, x2, y2, score))
         return boxes
+
+    # Retained for pre-refactor callers that used the private spelling.
+    _collect_bird_boxes = collect_bird_boxes
 
     def identify_species_candidates(self, bird_image, top_k: int = 3) -> list[tuple[str, float]]:
         from PIL import Image

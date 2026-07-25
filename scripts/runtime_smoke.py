@@ -52,11 +52,32 @@ def main() -> None:
     os.environ.setdefault("EMAIL_FROM", "birdwatcher@example.invalid")
     os.environ.setdefault("EMAIL_TO", "recipient@example.invalid")
 
-    from birdwatcher import alerts, app, classification, config, media, models, region, tracking
+    from birdwatcher import (
+        alerts,
+        app,
+        classification,
+        config,
+        media,
+        models,
+        region,
+        species,
+        tracking,
+    )
 
     runtime = config.load_runtime_config()
     assert runtime.event_clear_seconds == 6.0
     assert runtime.settings.detector_model == "yolo11n.pt"
+    assert runtime.settings.tile_sweep_interval == 5.0
+
+    # Every species comparison must agree on one identity per bird.
+    assert species.canonical_species_key("Tit Mouse") == species.canonical_species_key(
+        "Tufted Titmouse"
+    )
+    plausible = region.identification_plausible_species(runtime.settings.region_profile, 7)
+    assert species.canonical_species_key("Tit Mouse") in plausible
+    assert classification.combine_classifier_predictions is region.combine_classifier_predictions
+    assert hasattr(models.BirdModels, "collect_bird_boxes")
+    assert callable(tracking.deduplicate_boxes)
     assert callable(models.BirdModels)
     assert callable(media.open_camera)
     assert callable(alerts.EmailRetryQueue)

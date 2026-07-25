@@ -29,6 +29,7 @@ class AppSettings:
     cooldown: timedelta
     scan_interval: float
     detection_confidence: float
+    tile_sweep_interval: float
     crop_padding: float
     burst_frames: int
     burst_frame_interval: float

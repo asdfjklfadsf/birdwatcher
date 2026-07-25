@@ -10,10 +10,26 @@ for name in ("cv2", "torch", "transformers", "ultralytics"):
 from birdwatcher.classification import (
     candidate_species_names,
     combine_classifier_predictions,
+    hybrid_predictions,
 )
 from birdwatcher.config import load_runtime_config
 from birdwatcher.constants import BROAD_REGIONAL_PRIOR_WEIGHT
+from birdwatcher.region import (
+    apply_regional_prior,
+    preferred_regional_species,
+    regional_species,
+)
 from birdwatcher.species import collapse_species_aliases
+
+
+class _StubModels:
+    """Stands in for BirdModels: broad candidates plus BioCLIP scoring."""
+
+    def __init__(self, raw_global):
+        self._raw_global = raw_global
+
+    def identify_species_candidates(self, bird_image, top_k=20):
+        return list(self._raw_global)
 
 
 class SpeciesAliasTests(unittest.TestCase):
@@ -74,12 +90,12 @@ class RegionalWeightConfigurationTests(unittest.TestCase):
         ):
             return load_runtime_config()
 
-    def test_weight_below_broad_regional_weight_is_rejected_at_startup(self):
+    def test_weight_below_one_is_rejected_at_startup(self):
         with self.assertRaisesRegex(
             ValueError,
-            r"REGIONAL_PRIOR_WEIGHT must be finite and at least 1\.5",
+            r"REGIONAL_PRIOR_WEIGHT must be finite and at least 1",
         ):
-            self._load_with_weight("1.49")
+            self._load_with_weight("0.9")
 
     def test_weight_equal_to_broad_regional_weight_is_allowed(self):
         runtime = self._load_with_weight(str(BROAD_REGIONAL_PRIOR_WEIGHT))
@@ -87,6 +103,37 @@ class RegionalWeightConfigurationTests(unittest.TestCase):
             runtime.settings.regional_prior_weight,
             BROAD_REGIONAL_PRIOR_WEIGHT,
         )
+
+    def test_weight_below_broad_weight_is_accepted_and_clamped_not_crashing(self):
+        """A weight under the broad multiplier used to crash every event."""
+        runtime = self._load_with_weight("1.0")
+        self.assertEqual(runtime.settings.regional_prior_weight, 1.0)
+
+        with patch(
+            "birdwatcher.classification.local_predictions_from_embedding",
+            return_value=[("Tufted Titmouse", 0.70), ("House Finch", 0.30)],
+        ):
+            predictions = hybrid_predictions(
+                _StubModels([("Tit Mouse", 0.60), ("House Finch", 0.40)]),
+                "crop",
+                "embedding",
+                {"Tufted Titmouse", "House Finch"},
+                preferred_regional_species("northern_nj", 7),
+                regional_species("northern_nj", 7),
+                runtime.settings,
+            )
+        self.assertAlmostEqual(sum(score for _, score in predictions), 1.0)
+        self.assertEqual(predictions[0][0], "Tufted Titmouse")
+
+    def test_neutral_weight_applies_no_regional_preference(self):
+        neutral = apply_regional_prior(
+            [("Azaras Spinetail", 0.55), ("Northern Cardinal", 0.45)],
+            preferred_regional_species("northern_nj", 7),
+            weight=1.0,
+            plausible_species=regional_species("northern_nj", 7),
+            plausible_weight=min(BROAD_REGIONAL_PRIOR_WEIGHT, 1.0),
+        )
+        self.assertEqual(neutral[0][0], "Azaras Spinetail")
 
 
 if __name__ == "__main__":

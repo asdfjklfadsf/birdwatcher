@@ -6,7 +6,6 @@ import os
 import re
 from datetime import timedelta
 
-from .constants import BROAD_REGIONAL_PRIOR_WEIGHT
 from .domain import AppSettings
 from .region import regional_species
 
@@ -64,14 +63,12 @@ def validate_settings(settings: AppSettings) -> None:
         raise ValueError("SPECIES_MIN_CONFIDENCE must be between 0 and 1")
     if not 0 <= settings.species_min_margin <= 1:
         raise ValueError("SPECIES_MIN_MARGIN must be between 0 and 1")
-    if (
-        not math.isfinite(settings.regional_prior_weight)
-        or settings.regional_prior_weight < BROAD_REGIONAL_PRIOR_WEIGHT
-    ):
-        raise ValueError(
-            "REGIONAL_PRIOR_WEIGHT must be finite and at least "
-            f"{BROAD_REGIONAL_PRIOR_WEIGHT:g}"
-        )
+    # The broad-plausibility multiplier is clamped to this value at use time, so
+    # any weight >= 1 is safe; 1.0 disables the regional preference entirely.
+    if not math.isfinite(settings.regional_prior_weight) or settings.regional_prior_weight < 1:
+        raise ValueError("REGIONAL_PRIOR_WEIGHT must be finite and at least 1")
+    if not math.isfinite(settings.tile_sweep_interval) or settings.tile_sweep_interval < 0:
+        raise ValueError("TILE_SWEEP_INTERVAL_SECONDS must be finite and nonnegative")
     regional_species(settings.region_profile, 7)
     if settings.email.use_ssl and settings.email.use_starttls:
         raise ValueError("Enable only one of SMTP_USE_SSL and SMTP_USE_STARTTLS")

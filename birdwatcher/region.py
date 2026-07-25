@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import math
-import re
 from collections import Counter, defaultdict
 
 from .domain import IdentificationResult
+from .species import (
+    canonical_species_key,
+    canonical_species_keys,
+    collapse_species_aliases,
+    normalize_species_key,
+)
 
 
 def season_for_month(month: int) -> str:
@@ -21,7 +26,12 @@ def season_for_month(month: int) -> str:
 
 
 def species_key(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.casefold())
+    """Normalize one label without resolving aliases.
+
+    Prefer :func:`birdwatcher.species.canonical_species_key` when comparing two
+    species: this helper keeps aliases distinct.
+    """
+    return normalize_species_key(name)
 
 
 _NORTHERN_NJ_RESIDENTS = {
@@ -224,23 +234,21 @@ def preferred_regional_species_names(profile: str, month: int) -> set[str]:
 
 
 def preferred_regional_species(profile: str, month: int) -> set[str]:
-    names = preferred_regional_species_names(profile, month)
-    aliases = {species_key("Tufted Titmouse"): species_key("Tit Mouse")}
-    preferred = {aliases.get(species_key(name), species_key(name)) for name in names}
-    supported = {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
-    return preferred & supported
+    """Canonical keys for locally preferred species the broad model can name."""
+    preferred = canonical_species_keys(preferred_regional_species_names(profile, month))
+    return preferred & canonical_species_keys(_NEW_JERSEY_MODEL_SPECIES)
 
 
 def regional_species(profile: str, month: int) -> set[str]:
     _validate_region_profile(profile)
     season_for_month(month)
-    return {species_key(name) for name in _NEW_JERSEY_MODEL_SPECIES}
+    return canonical_species_keys(_NEW_JERSEY_MODEL_SPECIES)
 
 
 def identification_plausible_species(profile: str, month: int) -> set[str]:
-    return regional_species(profile, month) | {
-        species_key(name) for name in preferred_regional_species_names(profile, month)
-    }
+    return regional_species(profile, month) | canonical_species_keys(
+        preferred_regional_species_names(profile, month)
+    )
 
 
 def apply_regional_prior(
@@ -260,7 +268,7 @@ def apply_regional_prior(
     plausible_species = plausible_species or set()
     weighted = []
     for label, score in predictions:
-        key = species_key(label)
+        key = canonical_species_key(label)
         factor = weight if key in preferred_species else plausible_weight if key in plausible_species else 1.0
         weighted.append((label, score * factor))
 
@@ -275,6 +283,12 @@ def combine_classifier_predictions(
     global_predictions: list[tuple[str, float]],
     local_weight: float,
 ) -> list[tuple[str, float]]:
+    """Blend BioCLIP and broad-classifier scores under one identity per species.
+
+    Aliases are collapsed first so that the two classifiers, which spell some
+    species differently, contribute to the same candidate instead of splitting
+    one bird's evidence across two labels.
+    """
     if not local_predictions or not global_predictions:
         raise ValueError("Both classifier prediction lists must be nonempty")
     if not math.isfinite(local_weight) or not 0 <= local_weight <= 1:
@@ -283,11 +297,11 @@ def combine_classifier_predictions(
     scores: defaultdict[str, float] = defaultdict(float)
     labels: dict[str, str] = {}
     for predictions, weight in (
-        (global_predictions, 1.0 - local_weight),
-        (local_predictions, local_weight),
+        (collapse_species_aliases(global_predictions), 1.0 - local_weight),
+        (collapse_species_aliases(local_predictions), local_weight),
     ):
         for label, score in predictions:
-            key = species_key(label)
+            key = canonical_species_key(label)
             labels[key] = label
             scores[key] += weight * score
 
@@ -323,7 +337,12 @@ def resolve_identification(
     runner_up_confidence = ranked_scores[1][1] / frame_count if len(ranked_scores) > 1 else 0.0
     margin = confidence - runner_up_confidence
     vote_count = votes[candidate_name]
-    out_of_region = bool(plausible_species) and species_key(candidate_name) not in plausible_species
+    # Winners arrive canonicalized, so the plausibility set must be compared on
+    # canonical keys too; matching raw labels here would reject any aliased
+    # species whose preferred spelling is absent from the regional checklists.
+    out_of_region = (
+        bool(plausible_species) and canonical_species_key(candidate_name) not in plausible_species
+    )
     uncertain = (
         vote_count < min_votes
         or confidence < min_confidence
