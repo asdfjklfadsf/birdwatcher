@@ -181,6 +181,11 @@ def detect_birds(
                     tile, 640, settings.detection_floor_confidence
                 ):
                     accept(x0 + lx1, y0 + ly1, x0 + lx2, y0 + ly2, score)
+        # Only the tiled pass merges results from more than one inference, so it
+        # is the only place a bird could be reported twice. Every other pass
+        # returns boxes the detector already ran NMS over, and suppressing those
+        # again would discard second birds the detector deliberately kept.
+        raw = deduplicate_boxes(raw)
 
     return [
         TrackedDetection(
@@ -188,7 +193,7 @@ def detect_birds(
             score=score,
             box=(x1, y1, x2, y2),
         )
-        for x1, y1, x2, y2, score in deduplicate_boxes(raw)
+        for x1, y1, x2, y2, score in raw
     ]
 
 

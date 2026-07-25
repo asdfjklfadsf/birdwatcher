@@ -113,6 +113,29 @@ class DetectionSweepTests(unittest.TestCase):
         )
         self.assertEqual(len(kept), 2)
 
+    def test_suppression_boundary_is_the_configured_threshold(self):
+        below = deduplicate_boxes([(100, 100, 180, 180, 0.90), (130, 100, 210, 180, 0.85)])
+        above = deduplicate_boxes([(100, 100, 180, 180, 0.90), (124, 100, 204, 180, 0.85)])
+        self.assertEqual(len(below), 2, "IoU 0.45 must survive")
+        self.assertEqual(len(above), 1, "IoU 0.54 must collapse")
+
+    def test_primary_pass_overlaps_are_not_suppressed(self):
+        """Two birds the detector kept must not be merged by a second NMS pass."""
+        models = _SweepModels(
+            {640: [(100, 100, 180, 180, 0.90), (120, 100, 200, 180, 0.85)]}
+        )
+        detections = detect_birds(models, _Frame(), _settings())
+        self.assertEqual(models.calls, [640])
+        self.assertEqual(len(detections), 2)
+
+    def test_floor_pass_overlaps_are_not_suppressed(self):
+        models = _SweepModels(
+            {1280: [(100, 100, 180, 180, 0.09), (120, 100, 200, 180, 0.08)]}
+        )
+        detections = detect_birds(models, _Frame(), _settings())
+        self.assertEqual(models.calls, [640, 1280])
+        self.assertEqual(len(detections), 2)
+
     def test_tile_sweep_is_skipped_when_disallowed(self):
         models = _SweepModels()
         detect_birds(models, _Frame(), _settings(), allow_tile_sweep=False)
