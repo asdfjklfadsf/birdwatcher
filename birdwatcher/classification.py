@@ -6,7 +6,12 @@ from typing import Any, Callable
 
 import cv2
 
-from .region import apply_regional_prior, combine_classifier_predictions
+from .constants import BROAD_REGIONAL_PRIOR_WEIGHT
+from .region import (
+    apply_regional_prior,
+    combine_classifier_predictions as combine_raw_classifier_predictions,
+)
+from .species import canonical_species_name, collapse_species_aliases
 from .tracking import TrackedDetection
 
 
@@ -99,7 +104,26 @@ def local_predictions_from_embedding(models, embedding, species_names: set[str])
 def candidate_species_names(
     preferred_names: set[str], raw_global_predictions: list[tuple[str, float]]
 ) -> set[str]:
-    return set(preferred_names) | {name for name, _ in raw_global_predictions}
+    return {
+        canonical_species_name(name)
+        for name in preferred_names
+    } | {
+        canonical_species_name(name)
+        for name, _ in raw_global_predictions
+    }
+
+
+def combine_classifier_predictions(
+    local_predictions: list[tuple[str, float]],
+    global_predictions: list[tuple[str, float]],
+    local_weight: float,
+) -> list[tuple[str, float]]:
+    """Blend classifier scores after collapsing equivalent species labels."""
+    return combine_raw_classifier_predictions(
+        collapse_species_aliases(local_predictions),
+        collapse_species_aliases(global_predictions),
+        local_weight,
+    )
 
 
 def hybrid_predictions(
@@ -117,7 +141,7 @@ def hybrid_predictions(
         preferred_keys,
         settings.regional_prior_weight,
         plausible_species=broad_keys,
-        plausible_weight=1.5,
+        plausible_weight=BROAD_REGIONAL_PRIOR_WEIGHT,
     )
     local_predictions = local_predictions_from_embedding(
         models,
