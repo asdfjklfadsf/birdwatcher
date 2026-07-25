@@ -94,7 +94,7 @@ class TrackingAndEventTests(unittest.TestCase):
             object(),
             initial,
             settings,
-            detect_fn=lambda _models, frame, _settings: detections[frame],
+            detect_fn=lambda _models, frame, _settings, **_kwargs: detections[frame],
             sleep_fn=lambda _seconds: None,
             clock_fn=lambda: 0.0,
         )

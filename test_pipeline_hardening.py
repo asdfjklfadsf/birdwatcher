@@ -14,7 +14,12 @@ from birdwatcher.region import (
     resolve_identification,
 )
 from birdwatcher.species import canonical_species_key, normalize_species_key
-from birdwatcher.tracking import deduplicate_boxes, detect_birds
+from birdwatcher.tracking import (
+    TileSweepThrottle,
+    TrackedDetection,
+    deduplicate_boxes,
+    detect_birds,
+)
 
 
 class _SweepModels:
@@ -126,6 +131,72 @@ class DetectionSweepTests(unittest.TestCase):
 
 
 class TileSweepThrottleTests(unittest.TestCase):
+    def test_throttle_allows_one_sweep_per_interval(self):
+        throttle = TileSweepThrottle(5.0)
+        self.assertTrue(throttle.allow(100.0))
+        self.assertFalse(throttle.allow(101.0))
+        self.assertFalse(throttle.allow(104.9))
+        self.assertTrue(throttle.allow(105.0))
+
+    def test_zero_interval_never_blocks(self):
+        throttle = TileSweepThrottle(0.0)
+        self.assertTrue(all(throttle.allow(float(tick)) for tick in range(5)))
+
+    def test_tracked_burst_shares_the_throttle_instead_of_sweeping_every_frame(self):
+        """A nine-frame burst used to allow eight unthrottled tile sweeps."""
+        from birdwatcher.tracking import collect_tracked_crops
+
+        requested = []
+        ticks = iter([float(t) for t in range(0, 60)])
+        throttle = TileSweepThrottle(5.0)
+
+        class Capture:
+            def read(self):
+                return True, "frame"
+
+        def fake_detect(_models, _frame, _settings, *, allow_tile_sweep=True):
+            requested.append(allow_tile_sweep)
+            return []
+
+        collect_tracked_crops(
+            Capture(),
+            object(),
+            TrackedDetection("crop", 0.8, (0, 0, 10, 10)),
+            types.SimpleNamespace(burst_frames=9, burst_frame_interval=1.0),
+            detect_fn=fake_detect,
+            sleep_fn=lambda _seconds: None,
+            clock_fn=lambda: next(ticks),
+            tile_sweep=throttle,
+        )
+
+        self.assertEqual(len(requested), 8)
+        self.assertLessEqual(sum(requested), 3)
+
+    def test_burst_sweeps_freely_when_no_throttle_is_supplied(self):
+        from birdwatcher.tracking import collect_tracked_crops
+
+        requested = []
+
+        class Capture:
+            def read(self):
+                return True, "frame"
+
+        def fake_detect(_models, _frame, _settings, *, allow_tile_sweep=True):
+            requested.append(allow_tile_sweep)
+            return []
+
+        collect_tracked_crops(
+            Capture(),
+            object(),
+            TrackedDetection("crop", 0.8, (0, 0, 10, 10)),
+            types.SimpleNamespace(burst_frames=4, burst_frame_interval=0.0),
+            detect_fn=fake_detect,
+            sleep_fn=lambda _seconds: None,
+            clock_fn=lambda: 0.0,
+        )
+
+        self.assertEqual(requested, [True, True, True])
+
     def test_run_loop_rate_limits_the_tile_sweep(self):
         from datetime import timedelta
         from pathlib import Path

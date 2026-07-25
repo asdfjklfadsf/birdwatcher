@@ -19,7 +19,13 @@ from .region import (
     regional_species,
     resolve_identification,
 )
-from .tracking import ActiveEventTracker, choose_initial_detection, collect_tracked_crops, detect_birds
+from .tracking import (
+    ActiveEventTracker,
+    TileSweepThrottle,
+    choose_initial_detection,
+    collect_tracked_crops,
+    detect_birds,
+)
 from .validation import validate_bird_event
 
 LOG = logging.getLogger("bird_watcher")
@@ -35,9 +41,10 @@ def process_new_event(
     *,
     retry_queue: EmailRetryQueue | None = None,
     clock_fn: Callable[[], float] = time.monotonic,
+    tile_sweep: TileSweepThrottle | None = None,
 ) -> bool:
     """Validate, classify, save, and alert once for one newly observed bird event."""
-    tracked = collect_tracked_crops(capture, models, initial, settings)
+    tracked = collect_tracked_crops(capture, models, initial, settings, tile_sweep=tile_sweep)
     valid, reason = validate_bird_event(
         [(item.crop, item.score) for item in tracked],
         settings.min_valid_bird_frames,
@@ -138,7 +145,7 @@ def run(runtime_config: RuntimeConfig) -> None:
     )
     retry_queue = EmailRetryQueue(settings.image_dir / ".email_retry_queue")
     capture = None
-    next_tile_sweep = 0.0
+    tile_sweep = TileSweepThrottle(settings.tile_sweep_interval)
     LOG.info(
         "Watching camera %r; active events clear after %.1fs of absence",
         settings.camera,
@@ -172,12 +179,10 @@ def run(runtime_config: RuntimeConfig) -> None:
                 scan_clock = time.monotonic()
                 # The nine-tile sweep only helps for small/distant birds and
                 # costs nine extra inferences, so run it on a slower cadence
-                # instead of on every idle frame.
-                allow_tile_sweep = scan_clock >= next_tile_sweep
-                if allow_tile_sweep:
-                    next_tile_sweep = scan_clock + settings.tile_sweep_interval
+                # instead of on every idle frame. Tracked bursts share this
+                # budget rather than getting an unthrottled one of their own.
                 detections = detect_birds(
-                    models, frame, settings, allow_tile_sweep=allow_tile_sweep
+                    models, frame, settings, allow_tile_sweep=tile_sweep.allow(scan_clock)
                 )
                 if not detections:
                     active_events.observe_no_detection(scan_clock)
@@ -199,6 +204,7 @@ def run(runtime_config: RuntimeConfig) -> None:
                     active_events,
                     datetime.now().astimezone(),
                     retry_queue=retry_queue,
+                    tile_sweep=tile_sweep,
                 )
             except Exception:
                 LOG.exception("Detection failed; continuing")

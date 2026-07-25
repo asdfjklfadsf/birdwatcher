@@ -200,6 +200,27 @@ def match_tracked_detection(
     return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
+class TileSweepThrottle:
+    """Rate-limit the nine-tile sweep across every stage of the pipeline.
+
+    Top-level scans and tracked bursts share one instance, so a burst cannot
+    spend nine extra inferences per frame while the idle loop is being polite.
+    Time is supplied by the caller, which already reads a clock.
+    """
+
+    def __init__(self, interval_seconds: float):
+        if not math.isfinite(interval_seconds) or interval_seconds < 0:
+            raise ValueError("Tile sweep interval must be finite and nonnegative")
+        self.interval_seconds = interval_seconds
+        self._next_allowed = 0.0
+
+    def allow(self, now: float) -> bool:
+        if now < self._next_allowed:
+            return False
+        self._next_allowed = now + self.interval_seconds
+        return True
+
+
 def collect_tracked_crops(
     capture,
     models,
@@ -209,6 +230,7 @@ def collect_tracked_crops(
     detect_fn: Callable = detect_birds,
     sleep_fn: Callable[[float], None] = time.sleep,
     clock_fn: Callable[[], float] = time.monotonic,
+    tile_sweep: TileSweepThrottle | None = None,
 ) -> list[TrackedDetection]:
     detections = [initial_detection]
     previous_box: Box | None = None
@@ -222,9 +244,12 @@ def collect_tracked_crops(
         ok, frame = capture.read()
         if not ok or frame is None:
             continue
+        # A nine-frame burst would otherwise be able to run the tile sweep eight
+        # times, stretching the sampling schedule well past its wall-clock plan.
+        allow_tile_sweep = tile_sweep is None or tile_sweep.allow(clock_fn())
         matched = match_tracked_detection(
             current_box,
-            detect_fn(models, frame, settings),
+            detect_fn(models, frame, settings, allow_tile_sweep=allow_tile_sweep),
             previous_box,
         )
         if matched is None:
